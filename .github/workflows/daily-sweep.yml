@@ -1,0 +1,80 @@
+name: Daily Sweep Report
+
+on:
+  schedule:
+    # 14:00 UTC = 19:30 IST (IST = UTC+5:30). Every day.
+    # GitHub cron is ALWAYS UTC and has no DST, and India has no DST either,
+    # so this fires at exactly 19:30 IST all year round — safely after the
+    # 15:30 IST NSE close, so the screened candle is the confirmed close.
+    - cron: "0 14 * * *"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Use only the first N NSE symbols (0 = full market). Use 60 for a quick test."
+        required: false
+        default: "0"
+      send_email:
+        description: "Send the email?"
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: daily-sweep
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -q -U pip
+          pip install -q -r requirements.txt
+
+      - name: Offline diagnosis (engine contract tests, 55 checks)
+        env:
+          MPLBACKEND: Agg
+        run: python tests/test_offline.py
+
+      - name: Run screener and email the report
+        env:
+          MY_EMAIL: ${{ secrets.MY_EMAIL }}
+          MY_APP_PASSWORD: ${{ secrets.MY_APP_PASSWORD }}
+          # optional: only needed if the report should go somewhere other than MY_EMAIL
+          REPORT_TO: ${{ secrets.REPORT_TO }}
+          MPLBACKEND: Agg
+          PYTHONUNBUFFERED: "1"
+        run: |
+          ARGS=""
+          if [ "${{ inputs.limit }}" != "" ] && [ "${{ inputs.limit }}" != "0" ]; then
+            ARGS="$ARGS --limit ${{ inputs.limit }}"
+          fi
+          if [ "${{ inputs.send_email }}" = "false" ]; then
+            ARGS="$ARGS --no-email"
+          fi
+          echo "run_sweep.py $ARGS"
+          python run_sweep.py $ARGS
+
+      - name: Upload report artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-sweep-report
+          path: |
+            out/*.html
+            out/*.csv
+            out/charts/*.png
+          retention-days: 60
+          if-no-files-found: warn

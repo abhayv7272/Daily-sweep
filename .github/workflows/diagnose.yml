@@ -1,0 +1,49 @@
+name: Deep Diagnosis
+
+on:
+  workflow_dispatch:
+    inputs:
+      smtp_check:
+        description: "Also verify the Gmail SMTP login (no email is sent)?"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -q -U pip
+          pip install -q -r requirements.txt
+
+      - name: Offline engine contract tests (55 checks)
+        env:
+          MPLBACKEND: Agg
+        run: python tests/test_offline.py
+
+      - name: Real-network data diagnosis (NSE + Yahoo + 15-min path)
+        env:
+          MPLBACKEND: Agg
+          PYTHONUNBUFFERED: "1"
+        run: python diagnose.py
+
+      - name: Gmail SMTP login check (optional)
+        if: inputs.smtp_check
+        env:
+          MY_EMAIL: ${{ secrets.MY_EMAIL }}
+          MY_APP_PASSWORD: ${{ secrets.MY_APP_PASSWORD }}
+          PYTHONUNBUFFERED: "1"
+        run: python diagnose.py --smtp
