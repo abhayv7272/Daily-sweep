@@ -287,6 +287,31 @@ vz = [(o, h, l, c, 0.0) for o, h, l, c, v in sweep_rows()]
 rec = engine.analyze_symbol(ohlcv(vz), CFG)
 check("zero-volume handled (no crash, still a sweep)", rec is not None and math.isfinite(rec["Vol_x"]))
 
+# ---- FIXED-notebook behaviours (the version on main) ----
+# tie-aware fractal: exact double bottom keeps its first touch
+dbl = [(104.0, 104.3, 102.5, 102.8, 1e6), (102.8, 103.0, 100.0, 100.8, 1e6),
+       (100.8, 101.9, 100.6, 101.6, 1e6), (101.6, 101.9, 100.0, 100.9, 1e6),
+       (100.9, 102.2, 100.7, 102.0, 1e6), (102.0, 102.8, 101.8, 102.5, 1e6),
+       (102.5, 103.0, 102.1, 102.7, 1e6), (102.0, 103.2, 99.60, 102.4, 1.6e6)]
+pref = [(105.0 + (i % 5) * 0.2,) * 1 for i in range(60)]
+pref = [(x[0], x[0] + 0.8, x[0] - 0.8, x[0] + 0.3, 1e6) for x in pref]
+rec_d = engine.analyze_symbol(ohlcv(pref + dbl), CFG)
+check("tie-aware: equal-low double bottom sweepable", rec_d is not None and
+      abs(rec_d["Swept_Level"] - 100.0) < 1e-9)
+
+# NaN low on the signal bar must never mint a setup
+nanl = sweep_rows(last=(101.8, 103.0, float("nan"), 102.6, 1_800_000.0))
+check("NaN-low signal bar rejected", engine.analyze_symbol(ohlcv(nanl), CFG) is None)
+
+# flat-tape RSI is neutral 50 (not fake 100)
+eq("flat-tape RSI = 50", float(engine.rsi_wilder(np.array([100.0] * 30)).iloc[-1]), 50.0)
+
+# NaN volume is sanitised to 0 (Vol_x falls back to 1.0), never NaN
+nv = [(o, h, l, c, float("nan")) for o, h, l, c, v in sweep_rows()]
+rec_v = engine.analyze_symbol(ohlcv(nv), CFG)
+check("NaN volume sanitised", rec_v is not None and math.isfinite(rec_v["Vol_x"])
+      and rec_v["Vol_x"] == 1.0)
+
 
 # ═══════════════════════════════ §8 screen_all ordering + isolation
 print("\n§8 screen_all — ordering & error isolation")

@@ -3,26 +3,29 @@ dlsweep/engine.py — the NSE DAILY Liquidity-Sweep Screener engine.
 
 Every function below is copied VERBATIM from NSE_Liquidity_Sweep_Screener_FIXED.ipynb
 (cell numbers noted above each block) so an unattended GitHub Actions run produces
-EXACTLY the result you see when you press "Run all" in Colab. Only two mechanical
-adaptations exist, and neither can change a number:
+EXACTLY the result you see when you press "Run all" in Colab. The notebook on the
+`main` branch is the ground truth.
 
-  1. The one-line typo in the data-health gate of the original GitHub upload
-     (`if CFG.require_latest_s sessession:`) is repaired to
-     `if CFG.require_latest_session:` — as committed that line is a SyntaxError,
-     and the repaired text is what the working Colab copy of the notebook has.
-  2. Notebook cell top-level statements are wrapped in functions
-     (rank_universe / fetch_history / self_test / format_results), and
-     plot_setup() takes the DATA dict as an argument and returns the figure
-     instead of calling plt.show() — same drawing code, headless backend.
+Exactly TWO additive robustness fixes exist vs. the notebook, and neither can change
+a detected setup, level or score (they only recover data the notebook silently drops):
+
+  * chunked_download / backfill_latest — if yfinance returns a FLAT (non-MultiIndex)
+    frame for a 1-symbol request (older yfinance shape), xs() raises TypeError which
+    the notebook's bare `except` swallows, dropping that symbol. We recover the frame
+    when the chunk has exactly one symbol and columns are not a MultiIndex.
+  * Notebook cell top-level statements are wrapped in functions
+    (rank_universe / fetch_history / self_test / format_results), and
+    plot_setup() takes the DATA dict as an argument and returns the figure
+    instead of calling plt.show() — same drawing code, headless backend.
 
 Notebook map:
   cell 1   imports
   cell 3   SweepConfig (dataclass, all knobs)
-  cell 5   NSE universe fetch (+embedded fallback list)
+  cell 5   NSE universe fetch (dual archive URLs + cookie warm-up + fallback list)
   cell 8   chunked_download() + turnover ranking
   cell 9   backfill_latest() + full-history download + data-health gate
-  cell 11  sweep engine + scoring
-  cell 12  self-test (synthetic candles)
+  cell 11  sweep engine + scoring (tie-aware fractals, NaN-safe OHLC, RSI-50 flat tape)
+  cell 12  self-test (synthetic candles + 3 regressions)
   cell 14  results-table formatter
   cell 15  setup_report text + plot_setup chart
 """
@@ -105,8 +108,17 @@ import io
 
 import requests
 
-NSE_LIST_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+NSE_LIST_URLS = [
+    "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",
+    "https://archives.nseindia.com/content/equities/EQUITY_L.csv",   # legacy mirror
+]
+HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": "text/csv,application/csv,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/",
+}
 
 # Fallback: ~top 300 liquid NSE names (used only if the official list is unreachable)
 FALLBACK_SYMBOLS = [
@@ -155,19 +167,32 @@ FALLBACK_SYMBOLS = [
 
 
 def fetch_nse_universe():
-    try:
-        r = requests.get(NSE_LIST_URL, headers=HEADERS, timeout=30)
-        r.raise_for_status()
-        df = pd.read_csv(io.StringIO(r.text))
-        df.columns = [c.strip() for c in df.columns]
-        df = df[df["SYMBOL"].notna() & (df["SYMBOL"].astype(str).str.len() > 0)]
-        df = df[["SYMBOL", "NAME OF COMPANY"]].copy()
-        df["SYMBOL"] = df["SYMBOL"].astype(str).str.upper().str.strip()
-        df = df.drop_duplicates("SYMBOL").reset_index(drop=True)
-        src = "NSE official archive"
-        print(f"  ✓ fetched full NSE list ({len(df):,} symbols) from {src}")
-    except Exception as exc:
-        print(f"  ⚠ NSE list fetch failed ({exc.__class__.__name__}: {exc})")
+    df, src = None, None
+    sess = requests.Session()
+    sess.headers.update(HEADERS)
+    try:            # warm up cookies — NSE's WAF rejects cookie-less requests from many IPs
+        sess.get("https://www.nseindia.com/", timeout=15)
+    except Exception:
+        pass
+    for url in NSE_LIST_URLS:
+        try:
+            r = sess.get(url, timeout=30)
+            r.raise_for_status()
+            if "<html" in r.text[:200].lower():          # WAF "Access Denied" page with HTTP 200
+                raise RuntimeError("blocked by NSE WAF (HTML instead of CSV)")
+            df = pd.read_csv(io.StringIO(r.text))
+            df.columns = [c.strip() for c in df.columns]
+            df = df[df["SYMBOL"].notna() & (df["SYMBOL"].astype(str).str.len() > 0)]
+            df = df[["SYMBOL", "NAME OF COMPANY"]].copy()
+            df["SYMBOL"] = df["SYMBOL"].astype(str).str.upper().str.strip()
+            df = df.drop_duplicates("SYMBOL").reset_index(drop=True)
+            src = "NSE official archive"
+            print(f"  ✓ fetched full NSE list ({len(df):,} symbols) from {url.split('/')[2]}")
+            break
+        except Exception as exc:
+            print(f"  ⚠ NSE list fetch failed on {url.split('/')[2]} "
+                  f"({exc.__class__.__name__}: {exc})")
+    if df is None:
         print(f"  → falling back to embedded list of {len(FALLBACK_SYMBOLS)} liquid names")
         df = pd.DataFrame({"SYMBOL": FALLBACK_SYMBOLS, "NAME OF COMPANY": ""})
         src = "embedded fallback"
@@ -255,6 +280,9 @@ def rank_universe(universe_all):
             "Avg_Turnover_Cr": float((tail["Close"] * tail["Volume"]).mean() / 1e7),
             "Last_Close": float(df["Close"].iloc[-1]),
         })
+    if not rows:
+        raise SystemExit("✖ Turnover ranking produced no data — Yahoo may be rate-limiting this IP. "
+                         "Wait a minute and re-run this cell.")
     rank_df = (pd.DataFrame(rows)
                 .sort_values("Avg_Turnover_Cr", ascending=False)
                 .reset_index(drop=True))
@@ -296,7 +324,9 @@ def backfill_latest(symbols, target_date, chunk=40):
                 intr = yf.download(part, start=str(target_date), end=end, interval="15m",
                                    group_by="ticker", auto_adjust=False,
                                    threads=True, progress=False)
-                ok = intr is not None and len(intr) > 0
+                if intr is None or len(intr) == 0:
+                    raise RuntimeError("empty response")
+                ok = True
                 break
             except Exception as exc:
                 wait = CFG.backoff_secs * (2 ** (attempt - 1)) + random.uniform(0, 2)
@@ -307,14 +337,14 @@ def backfill_latest(symbols, target_date, chunk=40):
             continue
         for sym in part:
             try:
-                i = intr.xs(sym, axis=1, level="Ticker").dropna(subset=["Close"])
+                i = intr.xs(sym, axis=1, level="Ticker").dropna(subset=["Open", "High", "Low", "Close"])
             except (KeyError, ValueError):
                 continue
             except TypeError:
                 # [fix] same 1-symbol flat-frame recovery as chunked_download
                 if len(part) != 1 or isinstance(intr.columns, pd.MultiIndex):
                     continue
-                i = intr.dropna(subset=["Close"])
+                i = intr.dropna(subset=["Open", "High", "Low", "Close"])
             i = i.sort_index()
             if not len(i):
                 continue
@@ -404,12 +434,21 @@ def fetch_history(universe):
 # cell 11 — SWEEP ENGINE (verbatim)
 # ============================================================
 def find_swing_lows(low, k):
-    """Indices i where low[i] is the UNIQUE minimum of low[i-k .. i+k] (fractal swing low)."""
+    """Indices i where low[i] is a fractal swing low of low[i-k .. i+k].
+
+    Tie-aware: strictly lower than the k bars on the LEFT, lower-or-EQUAL to the k bars
+    on the RIGHT. An exact double/triple bottom (equal lows — common on NSE's 0.05 tick)
+    keeps its FIRST touch as the level instead of being discarded entirely.
+    Windows containing non-finite lows are skipped (bad data can't mint levels).
+    """
     n = len(low)
     out = []
     for i in range(k, n - k):
         w = low[i - k:i + k + 1]
-        if low[i] <= w.min() and np.count_nonzero(w == low[i]) == 1:
+        if not np.isfinite(w).all():
+            continue
+        left, right = low[i - k:i], low[i + 1:i + k + 1]
+        if low[i] < left.min() and low[i] <= right.min():
             out.append((i, float(low[i])))
     return out
 
@@ -433,9 +472,9 @@ def rsi_wilder(close, period=14):
     delta = np.diff(close)
     gain = pd.Series(np.clip(delta, 0, None)).ewm(alpha=1 / period, adjust=False).mean()
     loss = pd.Series(np.clip(-delta, 0, None)).ewm(alpha=1 / period, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    out = (100 - 100 / (1 + rs)).fillna(100.0)
-    return out
+    out = pd.Series(np.where(loss > 0, 100 - 100 / (1 + gain / loss.where(loss > 0)),
+                             np.where(gain > 0, 100.0, 50.0)), index=gain.index)
+    return out   # zero-loss+zero-gain (flat tape) is neutral 50, not a fake 100
 
 
 def analyze_symbol(df, cfg):
@@ -447,10 +486,13 @@ def analyze_symbol(df, cfg):
     h = df["High"].to_numpy(dtype=float)
     l = df["Low"].to_numpy(dtype=float)
     c = df["Close"].to_numpy(dtype=float)
-    v = df["Volume"].to_numpy(dtype=float)
+    v = np.nan_to_num(df["Volume"].to_numpy(dtype=float))   # Yahoo lags Volume on fresh bars;
+                                                             # NaN here poisons Vol_x & turnover
     T = n - 1
-    if not (np.isfinite(o[T]) and np.isfinite(c[T]) and h[T] > 0):
-        return None
+    if not (np.isfinite(o[T]) and np.isfinite(h[T]) and np.isfinite(l[T])
+            and np.isfinite(c[T]) and h[T] > 0):
+        return None      # any non-finite OHLC on the signal bar -> NaN passes every
+                         # comparison filter silently and mints a NaN-stop "setup"
     if c[T] < cfg.min_price:
         return None
     rng = h[T] - l[T]
@@ -513,7 +555,7 @@ def analyze_symbol(df, cfg):
         s_rsi = max(0.0, 0.6 * rsi / 25.0)
     else:
         s_rsi = max(0.0, 1.0 - (rsi - 65.0) / 30.0)
-    s_ema = {2: 1.0, 1: 0.55, 0: 0.2}[(c[T] > e50) + (c[T] > e20)]
+    s_ema = {2: 1.0, 1: 0.55, 0: 0.2}[int(c[T] > e50) + int(c[T] > e20)]  # int() casts: numpy-bool "+" is logical OR, never 2
 
     score = 25 * s_wick + 15 * s_close + 15 * s_depth + 15 * s_vol + 15 * s_rsi + 15 * s_ema
 
@@ -597,11 +639,34 @@ def self_test(cfg=None):
     assert analyze_symbol(_synthetic_df(rows_flat), SweepConfig()) is None, \
         "negative test 2 FAILED — no pierce must not count"
 
+    # regression: EQUAL-LOW double bottom (NSE tick size makes exact ties common) must be detected
+    rows_dbl = rows[:60] + [(104.0, 104.3, 102.5, 102.8, 1e6),
+                            (102.8, 103.0, 100.0, 100.8, 1e6),    # low #1 = 100.00
+                            (100.8, 101.9, 100.6, 101.6, 1e6),
+                            (101.6, 101.9, 100.0, 100.9, 1e6),    # low #2 = 100.00 (exact tie)
+                            (100.9, 102.2, 100.7, 102.0, 1e6),
+                            (102.0, 102.8, 101.8, 102.5, 1e6),
+                            (102.5, 103.0, 102.1, 102.7, 1e6),
+                            (102.0, 103.2, 99.60, 102.4, 1.6e6)]  # sweep of the double bottom
+    rec_dbl = analyze_symbol(_synthetic_df(rows_dbl), SweepConfig())
+    assert rec_dbl is not None and abs(rec_dbl["Swept_Level"] - 100.0) < 1e-9, \
+        "regression FAILED — equal-low double bottom must be sweepable"
+
+    # regression: NaN Low on the signal bar must NEVER produce a setup
+    rows_nan = rows[:-1] + [(101.8, 103.0, float("nan"), 102.6, 1.8e6)]
+    assert analyze_symbol(_synthetic_df(rows_nan), SweepConfig()) is None, \
+        "regression FAILED — NaN low must be rejected, not scored"
+
+    # regression: flat tape RSI is neutral, not 100
+    assert abs(float(rsi_wilder(np.array([100.0] * 30)).iloc[-1]) - 50.0) < 1e-9, \
+        "regression FAILED — flat-tape RSI must be 50"
+
     out = "\n".join([
         "✅ ENGINE SELF-TEST PASSED",
         f"   positive  : level={rec['Swept_Level']:.2f} age={rec['Level_Age_Bars']}bars "
         f"depth={rec['Sweep_Depth_']:.2f}% wick={rec['LowerWick_']:.0f}% score={rec['Score']:.1f}",
         "   negative  : close-below-level rejected ✓ | no-pierce rejected ✓",
+        "   regression: equal-low double bottom ✓ | NaN-low bar ✓ | flat-tape RSI ✓",
     ])
     return out
 

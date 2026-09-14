@@ -60,9 +60,8 @@ hain — 60 din tak.
 
 ## 5. "Colab jaisa hi result" kaise guaranteed hai
 
-- `dlsweep/engine.py` notebook ke code cells se **verbatim** copy hai (har block par cell number comment mein likha hai). Screening/ranking/scoring ka ek bhi number runner ke paas nahi aata — sab engine ka output hai.
-- Ek hi edit: original GitHub upload ke cell 9 mein typo tha
-  `CFG.require_latest_s sessession:` jo **SyntaxError** hai — Colab ki working copy mein yehi line `CFG.require_latest_session:` hai, wahi repair ki gayi hai. Iss repair ke bina notebook bhi crash karti.
+- `dlsweep/engine.py` aapki **`NSE_Liquidity_Sweep_Screener_FIXED.ipynb`** (main branch — wahi jo aap Colab mein chalate ho) ke code cells se **verbatim** copy hai (har block par cell number comment mein likha hai). Screening/ranking/scoring ka ek bhi number runner ke paas nahi aata — sab engine ka output hai.
+- Sirf do **additive** robustness fixes hain (kisi detected setup/level/score par zero asar): agar yfinance kisi 1-symbol request par flat frame bheje to notebook use silently drop kar deta hai — engine use recover kar leta hai (download + backfill dono jagah).
 - `config.py` notebook ke `SweepConfig` defaults ko verbatim mirror karta hai. Rules badalne ho to yahin badlo — notebook ke cell 3 mein bhi wahi change kar lena, dono same rahenge.
 - Dependencies unpinned hain — Colab bhi latest install karta hai, Actions bhi latest; same versions ⇒ same behaviour.
 - Har run mein **engine self-test** (notebook cell 12: synthetic candles par positive + 2 negative asserts) sabse pehle chalta hai; fail ho jaye to run abort ho jata hai, ghalat report kabhi nahi jaati.
