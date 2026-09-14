@@ -43,7 +43,7 @@ jobs:
           python -m pip install -q -U pip
           pip install -q -r requirements.txt
 
-      - name: Offline diagnosis (engine contract tests, 55 checks)
+      - name: Offline diagnosis (engine contract tests, 62 checks)
         env:
           MPLBACKEND: Agg
         run: python tests/test_offline.py

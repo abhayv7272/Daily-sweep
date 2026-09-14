@@ -17,9 +17,11 @@ Covers everything that can be tested without network:
   10. plot_setup — short data, returns a real figure
   11. build_html — empty day, special chars (&), chart cap
   12. emailer clipping boundary
+  13. email Date header is pinned to IST (+0530)
 
 Run:  python tests/test_offline.py        (exit 0 = everything green)
 """
+import datetime as dt
 import os
 import sys
 import math
@@ -371,6 +373,16 @@ clipped = emailer._clipped_notice(big, "<!--chart-card-->")
 check("clipped under limit", len(clipped.encode()) < emailer.INLINE_LIMIT + 3_000)
 check("clipped ends with notice", "attached" in clipped and clipped.endswith("</html>"))
 check("no mid-tag cut at boundary", clipped.rindex("<!--chart-card-->") < clipped.rindex("attached"))
+
+
+# ═══════════════════════════════ §13 email Date header timezone
+print("\n§13 emailer — Date header pinned to IST")
+cron_utc = dt.datetime(2026, 9, 14, 14, 0, 0, tzinfo=dt.timezone.utc)
+cron_hdr = emailer._format_email_date_ist(cron_utc)
+check("14:00 UTC schedule shows 19:30 IST", "19:30:00 +0530" in cron_hdr)
+check("Date header carries +0530 offset", cron_hdr.endswith("+0530"), cron_hdr)
+naive_hdr = emailer._format_email_date_ist(dt.datetime(2026, 9, 14, 19, 30, 0))
+check("naive date treated as IST, not runner UTC", "19:30:00 +0530" in naive_hdr)
 
 
 # ═══════════════════════════════ summary

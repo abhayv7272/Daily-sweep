@@ -40,9 +40,12 @@ OUT_DIR = os.path.join(ROOT, "out")
 sys.path.insert(0, ROOT)
 os.makedirs(OUT_DIR, exist_ok=True)
 
+# India has no daylight saving time, so +05:30 is stable all year.
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30), "IST")
+
 
 def now_ist() -> dt.datetime:
-    return dt.datetime.now(dt.timezone(dt.timedelta(hours=5, minutes=30)))
+    return dt.datetime.now(IST)
 
 
 def log(msg: str = "") -> None:

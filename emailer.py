@@ -20,19 +20,42 @@ works for both):
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import smtplib
 import ssl
 from email.message import EmailMessage
-from email.utils import formataddr, formatdate
+from email.utils import formataddr, format_datetime
 from typing import Optional, Sequence, Tuple
 
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
 
+# GitHub Actions runners use UTC as their OS timezone. If the email Date header
+# is built from the runner's local time, Gmail can show a UTC timestamp while the
+# report body says IST. India has no DST, so a fixed +05:30 timezone is exact all
+# year round.
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30), "IST")
+
 # Gmail clips a message body past ~102 kB. Charts live in the attachment anyway,
 # so keep the inline body under that and let the attachment carry the full thing.
 INLINE_LIMIT = 95_000
+
+
+def _format_email_date_ist(now: Optional[dt.datetime] = None) -> str:
+    """Return an RFC 2822 Date header pinned to India time (+0530).
+
+    The scheduled workflow runs on UTC-hosted GitHub runners, but the recipient
+    expects the mail timestamp to match Indian Standard Time. This helper keeps
+    the email header aligned with the report body's ``Generated ... IST`` stamp
+    and with the 19:30 IST schedule.
+    """
+    current = now or dt.datetime.now(IST)
+    if current.tzinfo is None or current.utcoffset() is None:
+        current = current.replace(tzinfo=IST)
+    else:
+        current = current.astimezone(IST)
+    return format_datetime(current)
 
 
 def send_report(subject: str, html_body: str, attachments: Sequence[Tuple[str, bytes, str]],
@@ -64,7 +87,7 @@ def send_report(subject: str, html_body: str, attachments: Sequence[Tuple[str, b
     msg["Subject"] = subject
     msg["From"] = formataddr((sender_name, user))
     msg["To"] = to
-    msg["Date"] = formatdate(localtime=True)
+    msg["Date"] = _format_email_date_ist()
 
     inline = html_body
     if len(inline.encode("utf-8")) > INLINE_LIMIT:

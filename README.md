@@ -69,7 +69,7 @@ hain — 60 din tak.
 
 ## 5b. QA — tests & deep diagnosis
 
-- **`tests/test_offline.py`** — 55 offline checks (engine parsing, backfill aggregation, health gate, sweep accept/reject matrix, HTML/email edges). Har daily run inhe pehle chalata hai; ek bhi fail hua to pipeline abort ho jati hai — ghalat email kabhi nahi jaati. Local chalane ke liye: `python tests/test_offline.py`
+- **`tests/test_offline.py`** — 62 offline checks (engine parsing, backfill aggregation, health gate, sweep accept/reject matrix, HTML/email edges, aur IST email timestamp). Har daily run inhe pehle chalata hai; ek bhi fail hua to pipeline abort ho jati hai — ghalat email kabhi nahi jaati. Local chalane ke liye: `python tests/test_offline.py`
 - **Actions → Deep Diagnosis → Run workflow** — real-network probes: NSE archive reachability, Yahoo batch availability (fallback ~300 symbols, ranking params), 15-min backfill path, version pinning proof, aur optional Gmail SMTP login check (mail nahi bhejta). Kuch bhi "data aa nahi raha" jaisa lage to yahi pehla step hai.
 
 ## 6. Repo ka structure
