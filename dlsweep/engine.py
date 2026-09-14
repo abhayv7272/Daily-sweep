@@ -212,8 +212,14 @@ def chunked_download(symbols, period, chunk=None, label="download"):
         for sym in part:
             try:
                 df = res.xs(sym, axis=1, level="Ticker")
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, ValueError):
                 continue  # symbol missing from response (delisted/renamed/404)
+            except TypeError:
+                # [fix] older yfinance returned a FLAT frame for a 1-symbol request —
+                # xs() then raised TypeError and the symbol was silently dropped.
+                if len(part) != 1 or isinstance(res.columns, pd.MultiIndex):
+                    continue
+                df = res.copy()
             df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
             df = df.dropna(subset=["Open", "High", "Low", "Close"])
             if len(df) and np.isfinite(df["Close"].to_numpy(dtype=float)).all():
@@ -302,8 +308,13 @@ def backfill_latest(symbols, target_date, chunk=40):
         for sym in part:
             try:
                 i = intr.xs(sym, axis=1, level="Ticker").dropna(subset=["Close"])
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, ValueError):
                 continue
+            except TypeError:
+                # [fix] same 1-symbol flat-frame recovery as chunked_download
+                if len(part) != 1 or isinstance(intr.columns, pd.MultiIndex):
+                    continue
+                i = intr.dropna(subset=["Close"])
             i = i.sort_index()
             if not len(i):
                 continue
