@@ -1,0 +1,7 @@
+# Unpinned on purpose: Google Colab also installs the latest releases, so
+# matching "latest" here is what keeps the Action's result identical to Colab's.
+pandas
+numpy
+requests
+matplotlib
+yfinance
