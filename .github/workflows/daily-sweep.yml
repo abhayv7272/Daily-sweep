@@ -1,22 +1,26 @@
 name: Daily Sweep Report
 
 on:
-  schedule:
-    # TARGET: email aapko ~20:30 IST tak milni chahiye. Queue + data fetch +
-    # charts + SMTP milkar ~6-7 minute lete hain, isliye trigger 20:23 IST
-    # (= 14:53 UTC) par rakha hai. GitHub cron HAMESHA UTC mein hota hai, aur
-    # na GitHub par na India mein DST hai — saal bhar waqt seedha rehta hai.
-    #
-    # ZAROORI — minute :00 (top-of-hour) mat lagana: usi minute duniya bhar ke
-    # repos ek saath queue hote hain aur free runner pool mein trigger GHANTON
-    # late ho jata hai (14-15 Sept 2026 ko yahi hua tha — 14:00 UTC ka cron
-    # 17:50/18:57 UTC par start hua, email ~11:25 PM IST par gayi). Off-peak
-    # minute (:53) par delay aam taur par kuch minute hi reh jata hai.
-    - cron: "53 14 * * *"
-  # Optional: bilkul exact-time chahiye to kisi external scheduler (cron-job.org
-  # wagairah) se repository_dispatch ping karwao — README "§7 exact-time option".
+  # ---- AUTOMATIC TRIGGER: sirf ek, external scheduler se -------------------
+  # GitHub ka apna `schedule:` (cron) JAAN-BOOJH KAR YAHAN NAHI HAI.
+  #
+  # Reason: cron-job.org ka ping aur GitHub ka internal cron dono ~20:23 IST par
+  # fire karte the ⇒ same din do runs ⇒ DUPLICATE EMAIL. Isliye automatic run ka
+  # single source of truth ab cron-job.org hai, jo exact waqt par ping karta hai
+  # (GitHub ki best-effort queue wait nahi karni padti — 14-15 Sept 2026 ko
+  # 14:00 UTC ka cron 17:50/18:57 UTC par start hua tha, email ~11:25 PM IST
+  # par gayi thi; external ping par aisi deri nahi hoti).
+  #
+  # Setup: README "§7a — Automatic daily trigger" — cron-job.org par daily 20:23 IST,
+  # POST https://api.github.com/repos/abhayv7272/Daily-sweep/dispatches
+  # body {"event_type": "daily-sweep"}.
+  #
+  # DOBARA `schedule:` cron MAT jodna, warna duplicate email wapas aa jayegi.
   repository_dispatch:
     types: [daily-sweep]
+  # Manual run — hamesha available (test karna ho ya kisi din ping miss ho jaye
+  # to report dubara nikalna ho). Manual run par duplicate-guard apply nahi hota:
+  # jo bologe wahi hoga, email bhi.
   workflow_dispatch:
     inputs:
       limit:
@@ -35,6 +39,8 @@ concurrency:
 
 permissions:
   contents: read
+  # duplicate-email guard ko aaj ke pichhle successful runs padhne hain
+  actions: read
 
 jobs:
   sweep:
@@ -58,17 +64,58 @@ jobs:
           MPLBACKEND: Agg
         run: python tests/test_offline.py
 
+      - name: Duplicate-email guard (automated runs only)
+        if: github.event_name != 'workflow_dispatch'
+        id: dedupe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # FAIL-OPEN guard: agar aaj (IST) already ek SUCCESSFUL automated run ho
+          # chuka hai — matlab email already chali gayi hai — to is run par email
+          # skip kar do, warna duplicate email chali jaati hai (double ping,
+          # cron-job.org retry, ya galti se do scheduler lag jayein to).
+          # Manual (workflow_dispatch) run is guard ke bahar hai — wo hamesha
+          # wahi karta hai jo aapne input diya.
+          # Check fail hua (API/rate-limit/jq) to PRIOR khali rehta hai aur email
+          # normally chali jaati hai: guard kabhi legit email nahi rokta.
+          TODAY_IST=$(TZ=Asia/Kolkata date +%F)
+          CUTOFF=$(TZ=Asia/Kolkata date -d "$TODAY_IST 00:00" +%s)
+          echo "Looking for an already-successful automated run since $TODAY_IST 00:00 IST (epoch $CUTOFF)..."
+          PRIOR=$( { gh run list \
+                       --workflow=daily-sweep.yml \
+                       --branch="$GITHUB_REF_NAME" \
+                       --status=success \
+                       --limit=30 \
+                       --json databaseId,event,createdAt \
+                     | jq -r --argjson cutoff "$CUTOFF" --argjson me "$GITHUB_RUN_ID" '
+                         [ .[]
+                           | select(.databaseId != $me)
+                           | select(.event == "repository_dispatch" or .event == "schedule")
+                           | select((.createdAt | sub("\\.[0-9]+"; "") | fromdate) >= $cutoff)
+                         ] | length'; } 2>/dev/null || true )
+          if [ -n "$PRIOR" ] && [ "$PRIOR" -gt 0 ] 2>/dev/null; then
+            echo "skip_email=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "⚠️ **Duplicate-email guard:** aaj ($TODAY_IST IST) ek automated run already successful raha hai, isliye is run se email nahi bheji gayi."
+              echo "Report + artifacts is run par bhi bane hain (proof ki pipeline healthy hai)."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip_email=false" >> "$GITHUB_OUTPUT"
+            echo "No prior successful automated run today (prior='${PRIOR:-check unavailable}') ⇒ email will be sent."
+          fi
+
       - name: Run screener and email the report
         env:
           MY_EMAIL: ${{ secrets.MY_EMAIL }}
           MY_APP_PASSWORD: ${{ secrets.MY_APP_PASSWORD }}
           # optional: only needed if the report should go somewhere other than MY_EMAIL
           REPORT_TO: ${{ secrets.REPORT_TO }}
-          # Scheduled run par report header ka transparency note: agar GitHub ne
-          # trigger dher der queue karke late diya, to email mein khud likha aa
-          # jayega "queued Xh Ym late by GitHub (planned ~20:30 IST)".
-          # Manual/dispatch trigger par khali rehta hai (note nahi dikhta).
-          EXPECTED_SEND_IST: ${{ github.event_name == 'schedule' && '20:30' || '' }}
+          # Automatic run (cron-job.org ka repository_dispatch ping) par report
+          # header ka transparency note: agar runner dher der baad start hua, to
+          # email mein khud likha aa jayega "run started Xh Ym late (planned
+          # ~20:30 IST · GitHub runner queue)". Manual trigger par khali rehta
+          # hai (note nahi dikhta).
+          EXPECTED_SEND_IST: ${{ (github.event_name == 'repository_dispatch' || github.event_name == 'schedule') && '20:30' || '' }}
           MPLBACKEND: Agg
           PYTHONUNBUFFERED: "1"
         run: |
@@ -76,7 +123,7 @@ jobs:
           if [ "${{ inputs.limit }}" != "" ] && [ "${{ inputs.limit }}" != "0" ]; then
             ARGS="$ARGS --limit ${{ inputs.limit }}"
           fi
-          if [ "${{ inputs.send_email }}" = "false" ]; then
+          if [ "${{ inputs.send_email }}" = "false" ] || [ "${{ steps.dedupe.outputs.skip_email }}" = "true" ]; then
             ARGS="$ARGS --no-email"
           fi
           echo "run_sweep.py $ARGS"
