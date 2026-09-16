@@ -49,6 +49,33 @@ def log(msg: str = "") -> None:
     print(msg, flush=True)
 
 
+def _queue_delay_note(now: dt.datetime) -> str:
+    """Honesty note for the report header: GitHub's cron is a best-effort queue,
+    not a timer — on busy days it fires hours late (14-15 Sept 2026: 4-5h).
+    EXPECTED_SEND_IST (e.g. "19:30", set only for scheduled runs) is compared
+    with the actual time; if the run is >25 min late we say so in the email, so
+    a late email never again looks like a silent bug."""
+    expected = os.environ.get("EXPECTED_SEND_IST", "").strip()
+    if not expected:
+        return ""
+    try:
+        hh, mm = (int(x) for x in expected.split(":")[:2])
+    except ValueError:
+        return ""
+    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    late_min = (now - target).total_seconds() / 60.0
+    if late_min < 0:
+        # GitHub's queue only ever runs LATE, never hours early — so a big
+        # negative gap means the previous day's slot arrived after midnight.
+        if late_min > -360:  # firing a few minutes/hours before the slot: on time
+            return ""
+        late_min += 1440
+    if late_min <= 25:
+        return ""
+    return (f" · run queued {int(late_min // 60)}h {round(late_min % 60)}m late by GitHub "
+            f"(planned ~{expected} IST)")
+
+
 # -------------------------------------------------------------------------- demo market
 def _demo_data():
     """Deterministic synthetic market (offline): 2 real sweeps, 1 rejected sweep, drift."""
@@ -147,7 +174,11 @@ def main() -> int:
     import report as RP
 
     t_start = time.time()
-    stamp = now_ist().strftime("%Y-%m-%d %H:%M")
+    started = now_ist()
+    stamp = started.strftime("%Y-%m-%d %H:%M")
+    delay_note = _queue_delay_note(started)
+    if delay_note:
+        log(f"NOTE: {delay_note.strip(' ·')}")
     log("=" * 78)
     log("NSE DAILY LIQUIDITY-SWEEP SCREENER — Swing-Buy Setups (automated run)")
     log(f"started {now_ist():%Y-%m-%d %H:%M:%S} IST" + ("  [DEMO MODE]" if args.demo else ""))
@@ -172,6 +203,8 @@ def main() -> int:
     res = show = None
     health = ""
     stats = {"universe_size": cfg.universe_size}
+    if delay_note:
+        stats["queue_delay_note"] = delay_note
 
     if args.demo:
         # ---------------------------------------------- offline demo path
