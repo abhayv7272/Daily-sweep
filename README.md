@@ -13,11 +13,12 @@ chart** ke saath.
 
 | Cheez | Kahan |
 |---|---|
-| Poora HTML report (dark fintech theme: header, KPIs, results table, saare marked charts, rules, data-health) | email body mein inline + `daily_sweep_report_<date>.html` attachment mein |
-| Results table — **bilkul wahi jo Colab `display()` dikhata hai** (Symbol, Swept Low, Depth %, Wick %, Vol x, RSI, Score…) | report ke andar + `…_results_<date>.csv` attachment |
-| Har setup ka chart — swept swing-low dashed line + SL zone + `SWEEP ✓` marker (notebook ka `plot_setup` code) | report mein embedded + har chart alag `.png` attachment |
-| Top-3 ka detailed trade-plan text (entry / SL / target / R:R) — notebook cell 15 jaisa | report ke chart cards mein |
-| Engine self-test + data-health report | report ke neeche + Actions logs mein |
+| Poora HTML report (executive dark fintech theme: Hero header, KPIs, Trend Reversal Matrix, results table, setup spotlights, marked charts, rules, data-health) | email body mein inline + `daily_sweep_report_<date>.html` attachment mein |
+| Results & Confluence Table — **Symbol, Close, Swept Low, Above %, Equal Lows, RSI Div, FVG Status, Vol x, Wick %, RSI, Grade, Score…** | report ke andar + `…_results_<date>.csv` attachment |
+| **Why Trend Will Go UP 🚀 Checklist** — har setup ke liye vibrant glowing confluence badges (RSI Div, Equal Lows pool, FVG, Volume absorption, Hammer, EMAs) | report ke setup cards mein |
+| Har setup ka high-res multi-panel chart — Candlesticks + Swept Low line + SL zone + **Bullish FVG shaded zone** + **Equal Lows** + **RSI Divergence ray & annotation panel** | report mein embedded + har chart alag `.png` attachment |
+| Top-3 ka detailed trade-plan text (entry / SL / target 1 / target 2 (2R) / R:R) | report ke chart cards mein |
+| Engine self-test (86 checks) + data-health report | report ke neeche + Actions logs mein |
 
 Email subject: `NSE Daily Sweep · N setups · DD Mon YYYY`.
 Agar uss din koi setup nahi banta, tab bhi email aati hai — "no setups" ke saath

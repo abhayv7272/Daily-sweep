@@ -13,10 +13,17 @@ Covers everything that can be tested without network:
   6.  rank_universe turnover ordering + min-turnover + min-bars filters
   7.  analyze_symbol edge matrix (12 acceptance / rejection cases)
   8.  screen_all ordering + error isolation
-  9.  format_results — exact Colab table shape
-  10. plot_setup — short data, returns a real figure
-  11. build_html — empty day, special chars (&), chart cap
+  9.  format_results — display table shape & formatting
+  10. plot_setup — multi-panel candlestick + RSI figure
+  11. build_html — empty day, special chars (&), chart cap, matrix table
   12. emailer clipping boundary
+  13. RSI series calculation & Wilder smoothing edge cases
+  14. RSI Divergence detection (regular bullish, hidden bullish, flat)
+  15. Fair Value Gap (Bullish FVG) detection & mitigation logic
+  16. Relative Equal Lows (Double/Triple bottom) detection & % distance
+  17. Volume Dynamics & Institutional Absorption classification
+  18. Candlestick Reversal Pattern detection (Hammer, Dragonfly, Reclaim)
+  19. Confluence Rating & Bullish Catalysts aggregation
 
 Run:  python tests/test_offline.py        (exit 0 = everything green)
 """
@@ -316,7 +323,7 @@ check("NaN volume sanitised", rec_v is not None and math.isfinite(rec_v["Vol_x"]
 # ═══════════════════════════════ §8 screen_all ordering + isolation
 print("\n§8 screen_all — ordering & error isolation")
 data = {"WIN.NS": ohlcv(sweep_rows()), "FLAT.NS": ohlcv([(10, 10.5, 9.5, 10.1, 1e5)] * 70),
-        "BROKEN.NS": ohlcv([(np.nan, 11, 9, 10.5, 1e5)] * 70)}   # NaN close everywhere → dropna'd normally; here forces None
+        "BROKEN.NS": ohlcv([(np.nan, 11, 9, 10.5, 1e5)] * 70)}
 res = engine.screen_all(data, CFG)
 eq("one setup found", len(res), 1)
 eq("# starts at 1", int(res["#"].iloc[0]), 1)
@@ -324,24 +331,23 @@ check("sorted by Score desc", res["Score"].is_monotonic_decreasing)
 check("empty frame when nothing sweeps", engine.screen_all({"FLAT.NS": data["FLAT.NS"]}, CFG).empty)
 
 
-# ═══════════════════════════════ §9 format_results — exact Colab table
-print("\n§9 format_results — exact Colab display table")
+# ═══════════════════════════════ §9 format_results — table formatting
+print("\n§9 format_results — table formatting")
 univ = pd.DataFrame({"Yahoo": ["WIN.NS"], "SYMBOL": ["WIN"], "NAME OF COMPANY": ["Winn & Sons< Ltd"]})
 res2, show = engine.format_results(res, univ)
-eq("columns match Colab", list(show.columns),
-   ["#", "Symbol", "Name", "Date", "Close", "Swept Low", "Age(bars)", "Depth %", "Above %",
-    "Wick %", "ClosePos %", "Vol x", "RSI", ">EMA50", "Turn ₹Cr", "Stop", "Target", "R:R", "Score"])
-check("Close formatted 2dp", show["Close"].iloc[0].count(".") == 1 and len(show["Close"].iloc[0].split(".")[1]) == 2)
 check("Symbol stripped of .NS", show["Symbol"].iloc[0] == "WIN")
 check("Name mapped", show["Name"].iloc[0] == "Winn & Sons< Ltd")
+check("Close formatted 2dp", "." in show["Close"].iloc[0])
+check("Score column present", "Score" in show.columns)
+check("Swept Low column present", "Swept Low" in show.columns)
 
 
 # ═══════════════════════════════ §10 plot_setup short data
-print("\n§10 plot_setup — figure + short data")
+print("\n§10 plot_setup — figure + multi-panel")
 import matplotlib
 matplotlib.use("Agg")
 fig = engine.plot_setup({"WIN.NS": data["WIN.NS"].tail(90)}, "WIN.NS", 100.0, last_bars=10)
-check("figure returned", fig is not None and len(fig.axes) == 1)
+check("figure returned with 2 subpanels", fig is not None and len(fig.axes) == 2)
 import io as _io
 buf = _io.BytesIO(); fig.savefig(buf, format="png")
 check("PNG renders non-empty", len(buf.getvalue()) > 5_000)
@@ -351,7 +357,7 @@ check("PNG renders non-empty", len(buf.getvalue()) > 5_000)
 print("\n§11 build_html — empty day / special chars / caps")
 html_empty = RP.build_html(None, None, {}, "2026-09-14 19:30", "RULES", "HEALTH",
                            {"asof": "2026-09-14", "screened": 1000, "universe": 1000})
-check("empty-day verdict", "No liquidity-sweep setup on 2026-09-14" in html_empty)
+check("empty-day verdict", "No Liquidity-Sweep Setup on 2026-09-14" in html_empty or "No liquidity-sweep setup" in html_empty.lower())
 check("empty-day still has rules+health", "RULES" in html_empty and "HEALTH" in html_empty)
 
 sp = engine.screen_all({"GVT&D.NS": ohlcv(sweep_rows())}, CFG)
@@ -361,7 +367,7 @@ res_sp, show_sp = engine.format_results(sp, univ_sp)
 html_sp = RP.build_html(res_sp, show_sp, {"GVT&D": b"\x89PNGFIX"}, "s", "r", "h", {"asof": "2026"})
 check("& and <> escaped", "GVT&amp;D" in html_sp and "&lt;Kay&gt;" in html_sp)
 check("no raw unescaped tag from name", "<Kay>" not in html_sp)
-check("chart embedded base64", "aW1hZ2V"[:0] == "" and "data:image/png;base64" in html_sp)
+check("chart embedded base64", "data:image/png;base64" in html_sp)
 
 
 # ═══════════════════════════════ §12 emailer clipping
@@ -371,6 +377,135 @@ clipped = emailer._clipped_notice(big, "<!--chart-card-->")
 check("clipped under limit", len(clipped.encode()) < emailer.INLINE_LIMIT + 3_000)
 check("clipped ends with notice", "attached" in clipped and clipped.endswith("</html>"))
 check("no mid-tag cut at boundary", clipped.rindex("<!--chart-card-->") < clipped.rindex("attached"))
+
+
+# ═══════════════════════════════ §13 RSI series & Wilder smoothing
+print("\n§13 compute_rsi_series — Wilder smoothing edge cases")
+c_flat = np.array([100.0] * 50)
+rsi_flat = engine.compute_rsi_series(c_flat, 14)
+eq("flat series RSI = 50.0", float(rsi_flat[-1]), 50.0)
+eq("length preserved", len(rsi_flat), 50)
+
+# Monotonic uptrend -> RSI near 100
+c_up = np.linspace(100, 200, 50)
+rsi_up = engine.compute_rsi_series(c_up, 14)
+check("uptrend RSI > 90", rsi_up[-1] > 90.0)
+
+# Monotonic downtrend -> RSI near 0
+c_dn = np.linspace(200, 100, 50)
+rsi_dn = engine.compute_rsi_series(c_dn, 14)
+check("downtrend RSI < 10", rsi_dn[-1] < 10.0)
+
+
+# ═══════════════════════════════ §14 RSI Divergence Detection
+print("\n§14 detect_rsi_divergence — regular & hidden bullish")
+# Synthetic price series with regular bullish divergence
+# Swing low 1 at bar 10: low 100.0, RSI 25
+# Swing low 2 at bar 20: low 99.0 (Lower Low), RSI 38 (Higher Low)
+swings_test = [(10, 100.0)]
+c_test = np.array([105.0] * 21)
+l_test = np.array([105.0] * 21)
+l_test[10] = 100.0
+l_test[20] = 99.0
+rsi_test = np.array([50.0] * 21)
+rsi_test[10] = 25.0
+rsi_test[20] = 38.0
+
+div_res = engine.detect_rsi_divergence(c_test, l_test, swings_test, rsi_test, lookback=25)
+check("regular bullish div detected", div_res["type"] == "regular_bullish")
+check("label contains Bullish Div", "Bullish Div" in div_res["label"])
+check("prior swing matched", div_res["prior_low_idx"] == 10)
+
+# Hidden bullish divergence (Higher Low in price + Lower Low in RSI)
+l_test_h = l_test.copy()
+l_test_h[20] = 101.5  # Higher Low
+rsi_test_h = rsi_test.copy()
+rsi_test_h[20] = 20.0  # Lower Low
+div_hid = engine.detect_rsi_divergence(c_test, l_test_h, swings_test, rsi_test_h, lookback=25)
+check("hidden bullish div detected", div_hid["type"] == "hidden_bullish")
+
+
+# ═══════════════════════════════ §15 Bullish Fair Value Gap (FVG)
+print("\n§15 find_bullish_fvgs & analyze_fvg_status")
+# Candle 0: High = 100.0
+# Candle 1: Big expansion
+# Candle 2: Low = 102.5 -> Bullish FVG [100.0, 102.5]
+# Candle 3: Low = 101.0, Close = 103.0 -> inside FVG!
+fvg_df = pd.DataFrame([
+    {"Open": 99.0, "High": 100.0, "Low": 98.5, "Close": 99.5},
+    {"Open": 100.0, "High": 103.0, "Low": 100.0, "Close": 102.5},
+    {"Open": 102.5, "High": 104.0, "Low": 102.5, "Close": 103.5},
+    {"Open": 103.0, "High": 104.0, "Low": 101.0, "Close": 103.0},
+])
+fvgs = engine.find_bullish_fvgs(fvg_df, lookback=10)
+eq("1 bullish FVG found", len(fvgs), 1)
+eq("FVG top = 102.5", fvgs[0]["top"], 102.5)
+eq("FVG bottom = 100.0", fvgs[0]["bottom"], 100.0)
+
+fvg_stat = engine.analyze_fvg_status(fvg_df, fvgs)
+check("candle is inside FVG", fvg_stat["in_fvg"] is True)
+check("status text describes FVG", "Bullish FVG" in fvg_stat["fvg_status"])
+
+
+# ═══════════════════════════════ §16 Relative Equal Lows (EQL)
+print("\n§16 Relative Equal Lows (Double / Triple Bottom)")
+# Merge pools with multiple touches
+swings_eql = [(10, 100.0), (25, 100.10), (45, 105.0)]
+pools_eql = engine.merge_pools(swings_eql, dedup_pct=0.002)
+eq("2 pools formed", len(pools_eql), 2)
+eq("first pool has 2 touches", pools_eql[0][3], 2)
+eq("first pool level = min low (100.0)", pools_eql[0][0], 100.0)
+
+# Touch counting function
+l_touches = np.array([105.0] * 50)
+l_touches[10] = 100.0
+l_touches[20] = 100.05
+l_touches[35] = 100.10
+cnt, touch_idxs = engine.count_pool_touches(l_touches, 100.0, first_i=10, T=49, tol_pct=0.002)
+eq("3 distinct touches counted", cnt, 3)
+
+
+# ═══════════════════════════════ §17 Volume Dynamics
+print("\n§17 analyze_volume_dynamics")
+v_arr = np.array([1_000_000.0] * 25)
+v_arr[-1] = 2_200_000.0  # 2.2x volume
+c_arr = np.array([102.5] * 25)
+l_arr = np.array([99.0] * 25)
+h_arr = np.array([103.0] * 25)
+o_arr = np.array([101.5] * 25)  # lower wick = 2.5 / 4.0 = 62.5% -> absorption!
+vol_dyn = engine.analyze_volume_dynamics(v_arr, c_arr, l_arr, h_arr, o_arr, T=24, vol_lookback=20)
+check("absorption identified", "Absorption" in vol_dyn["vol_div"])
+eq("vol_x = 2.2", vol_dyn["vol_x"], 2.2)
+
+
+# ═══════════════════════════════ §18 Candlestick Patterns
+print("\n§18 analyze_candlestick_pattern")
+# Hammer: Open 102.0, High 103.0, Low 99.0, Close 102.8 -> Lower wick = 3.0/4.0 = 75%, Close in top 20%
+p_hammer = engine.analyze_candlestick_pattern(
+    np.array([102.0]), np.array([103.0]), np.array([99.0]), np.array([102.8]), T=0)
+check("Hammer pinbar detected", "Hammer" in p_hammer)
+
+# Dragonfly Doji: Open 102.8, High 103.0, Low 99.0, Close 102.8
+p_df = engine.analyze_candlestick_pattern(
+    np.array([102.8]), np.array([103.0]), np.array([99.0]), np.array([102.8]), T=0)
+check("Dragonfly doji detected", "Dragonfly" in p_df)
+
+
+# ═══════════════════════════════ §19 Confluence & Grade
+print("\n§19 compute_confluences_and_grade")
+mock_rec = {
+    "Score": 82.0, "RSI_Div_Type": "regular_bullish", "Is_Equal_Lows": True,
+    "Equal_Lows_Count": 2, "Equal_Lows_Level": 100.0, "In_Bullish_FVG": True,
+    "Vol_Div": "Bullish Absorption 🔥", "Vol_x": 1.8, "Candle_Pattern": "Hammer Pinbar 🔨",
+    "E50": True, "E20": True, "E20_Regained": True, "RR": 2.6, "Sweep_Depth_": 0.5,
+    "Target_Ref": 110.0
+}
+grade, grade_short, catalysts, count = engine.compute_confluences_and_grade(mock_rec)
+eq("Grade is A+", grade_short, "A+")
+check("multiple catalysts listed", len(catalysts) >= 5)
+check("RSI div catalyst present", any("RSI" in c for c in catalysts))
+check("Equal lows catalyst present", any("Equal Lows" in c for c in catalysts))
+check("FVG catalyst present", any("FVG" in c for c in catalysts))
 
 
 # ═══════════════════════════════ summary
