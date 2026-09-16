@@ -2,9 +2,9 @@ name: Daily Sweep Report
 
 on:
   schedule:
-    # TARGET: email aapko ~19:30 IST tak milni chahiye. Queue + data fetch +
-    # charts + SMTP milkar ~6-7 minute lete hain, isliye trigger 19:23 IST
-    # (= 13:53 UTC) par rakha hai. GitHub cron HAMESHA UTC mein hota hai, aur
+    # TARGET: email aapko ~20:30 IST tak milni chahiye. Queue + data fetch +
+    # charts + SMTP milkar ~6-7 minute lete hain, isliye trigger 20:23 IST
+    # (= 14:53 UTC) par rakha hai. GitHub cron HAMESHA UTC mein hota hai, aur
     # na GitHub par na India mein DST hai — saal bhar waqt seedha rehta hai.
     #
     # ZAROORI — minute :00 (top-of-hour) mat lagana: usi minute duniya bhar ke
@@ -12,7 +12,7 @@ on:
     # late ho jata hai (14-15 Sept 2026 ko yahi hua tha — 14:00 UTC ka cron
     # 17:50/18:57 UTC par start hua, email ~11:25 PM IST par gayi). Off-peak
     # minute (:53) par delay aam taur par kuch minute hi reh jata hai.
-    - cron: "53 13 * * *"
+    - cron: "53 14 * * *"
   # Optional: bilkul exact-time chahiye to kisi external scheduler (cron-job.org
   # wagairah) se repository_dispatch ping karwao — README "§7 exact-time option".
   repository_dispatch:
@@ -66,9 +66,9 @@ jobs:
           REPORT_TO: ${{ secrets.REPORT_TO }}
           # Scheduled run par report header ka transparency note: agar GitHub ne
           # trigger dher der queue karke late diya, to email mein khud likha aa
-          # jayega "queued Xh Ym late by GitHub (planned ~19:30 IST)".
+          # jayega "queued Xh Ym late by GitHub (planned ~20:30 IST)".
           # Manual/dispatch trigger par khali rehta hai (note nahi dikhta).
-          EXPECTED_SEND_IST: ${{ github.event_name == 'schedule' && '19:30' || '' }}
+          EXPECTED_SEND_IST: ${{ github.event_name == 'schedule' && '20:30' || '' }}
           MPLBACKEND: Agg
           PYTHONUNBUFFERED: "1"
         run: |

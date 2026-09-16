@@ -52,7 +52,7 @@ def log(msg: str = "") -> None:
 def _queue_delay_note(now: dt.datetime) -> str:
     """Honesty note for the report header: GitHub's cron is a best-effort queue,
     not a timer — on busy days it fires hours late (14-15 Sept 2026: 4-5h).
-    EXPECTED_SEND_IST (e.g. "19:30", set only for scheduled runs) is compared
+    EXPECTED_SEND_IST (e.g. "20:30", set only for scheduled runs) is compared
     with the actual time; if the run is >25 min late we say so in the email, so
     a late email never again looks like a silent bug."""
     expected = os.environ.get("EXPECTED_SEND_IST", "").strip()

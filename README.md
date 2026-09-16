@@ -54,12 +54,12 @@ hain — 60 din tak.
 
 ## 4. Schedule ka logic
 
-- **Email aapko ~19:30 IST par milni chahiye.** Poora pipeline (runner start + data fetch + charts + SMTP) ~6–7 minute ka hai, isliye workflow **19:23 IST (= 13:53 UTC)** par trigger hota hai: cron `53 13 * * *`, har din. IST mein DST nahi hota, GitHub UTC mein chalta hai — saal bhar waqt seedha rehta hai.
-- 19:30 IST NSE close (15:30) ke 4 ghante baad hai — isliye scanned candle **confirmed close** hoti hai (notebook bhi 15:35 IST ke baad run karne ko kehta hai).
+- **Email aapko ~20:30 IST par milni chahiye.** Poora pipeline (runner start + data fetch + charts + SMTP) ~6–7 minute ka hai, isliye workflow **20:23 IST (= 14:53 UTC)** par trigger hota hai: cron `53 14 * * *`, har din. IST mein DST nahi hota, GitHub UTC mein chalta hai — saal bhar waqt seedha rehta hai.
+- 20:30 IST NSE close (15:30) ke 5 ghante baad hai — isliye scanned candle **confirmed close** hoti hai (notebook bhi 15:35 IST ke baad run karne ko kehta hai).
 - **GitHub ka cron ek best-effort queue hai, timer nahi.** Minute `:00` (top-of-hour) par duniya bhar ke saare repos ek saath queue hote hain aur free runners par trigger ghanton late ho sakta hai — 14–15 Sept 2026 ko yahi hua tha: 14:00 UTC ka cron **17:50/18:57 UTC** par start hua aur email **raat ~11:25 PM IST** par gayi. Isliye cron ab off-peak minute `:53` par hai, jahan delay aam taur par kuch minute hi hota hai.
-- **Der ho to email khud bataati hai:** scheduled run par agar trigger 25+ minute late hua, report ke header mein amber colour mein likha aata hai — *"run queued Xh Ym late by GitHub (planned ~19:30 IST)"*. Ab email der se aaye to pata chal jayega ki run toota nahi, GitHub ki queue deri hai.
-- **Bilkul exact 19:30 IST chahiye?** GitHub cron ke bharose hatne ke liye free external scheduler (jaise cron-job.org) se `repository_dispatch` ping karwai ja sakti hai — workflow trigger ready hai (§7 dekho).
-- **Weekend / trading holiday:** NSE band hota hai, to "latest session" pichhle trading din ka rehta hai — report usi candle ko dobara bhejegi (candle date report mein saaf likhi hoti hai). Agar sirf Mon–Fri chahiye to workflow mein cron ko `"53 13 * * 1-5"` kar do.
+- **Der ho to email khud bataati hai:** scheduled run par agar trigger 25+ minute late hua, report ke header mein amber colour mein likha aata hai — *"run queued Xh Ym late by GitHub (planned ~20:30 IST)"*. Ab email der se aaye to pata chal jayega ki run toota nahi, GitHub ki queue deri hai.
+- **Bilkul exact 20:30 IST chahiye?** GitHub cron ke bharose hatne ke liye free external scheduler (jaise cron-job.org) se `repository_dispatch` ping karwai ja sakti hai — workflow trigger ready hai (§7 dekho).
+- **Weekend / trading holiday:** NSE band hota hai, to "latest session" pichhle trading din ka rehta hai — report usi candle ko dobara bhejegi (candle date report mein saaf likhi hoti hai). Agar sirf Mon–Fri chahiye to workflow mein cron ko `"53 14 * * 1-5"` kar do.
 
 ## 5. "Colab jaisa hi result" kaise guaranteed hai
 
@@ -68,7 +68,7 @@ hain — 60 din tak.
 - `config.py` notebook ke `SweepConfig` defaults ko verbatim mirror karta hai. Rules badalne ho to yahin badlo — notebook ke cell 3 mein bhi wahi change kar lena, dono same rahenge.
 - Dependencies unpinned hain — Colab bhi latest install karta hai, Actions bhi latest; same versions ⇒ same behaviour.
 - Har run mein **engine self-test** (notebook cell 12: synthetic candles par positive + 2 negative asserts) sabse pehle chalta hai; fail ho jaye to run abort ho jata hai, ghalat report kabhi nahi jaati.
-- Intraday vs close: schedule close ke baad hai, isliye 19:30-run aur aapka after-close Colab run same candle dekhte hain.
+- Intraday vs close: schedule close ke baad hai, isliye 20:30-run aur aapka after-close Colab run same candle dekhte hain.
 
 ## 5b. QA — tests & deep diagnosis
 
@@ -84,7 +84,7 @@ run_sweep.py                               # headless runner (self-test → scre
 report.py                                  # stunning HTML report builder (charts embedded)
 emailer.py                                 # Gmail SMTP sender (inline HTML + full .html + saare .png)
 config.py                                  # saare knobs (notebook SweepConfig + report settings)
-.github/workflows/daily-sweep.yml          # ~19:30 IST daily schedule + manual + external-exact-time triggers
+.github/workflows/daily-sweep.yml          # ~20:30 IST daily schedule + manual + external-exact-time triggers
 ```
 
 ## 7. Troubleshooting
@@ -96,15 +96,15 @@ config.py                                  # saare knobs (notebook SweepConfig +
 | Email nahi aayi par run green | Gmail spam folder check karo; `REPORT_TO` galat to nahi? |
 | Report mein "NSE list fetch failed… fallback" line | GitHub ke IP se NSE archive block ho gaya — engine automatic ~300 liquid names par chal gaya (notebook ka hi designed behaviour) |
 | Kisi din 0 setups | Normal hai — pattern roz nahi banta. Email tab bhi aayegi |
-| Email 19:30 se kaafi der se aayi | Pehle report header ka amber note dekho — *"queued Xh Ym late by GitHub"* likha hai to run theek tha, GitHub ki shared queue deri thi. Roz ho raha ho to neeche wala exact-time option lagao |
+| Email 20:30 se kaafi der se aayi | Pehle report header ka amber note dekho — *"queued Xh Ym late by GitHub"* likha hai to run theek tha, GitHub ki shared queue deri thi. Roz ho raha ho to neeche wala exact-time option lagao |
 | Local demo dekhna ho | `pip install -r requirements.txt && python run_sweep.py --demo --no-email` → `out/` mein sample report |
 
 ### Exact-time trigger (optional — GitHub queue ki deri buffer se hatne ke liye)
 
-Workflow mein `repository_dispatch: daily-sweep` trigger pehle se laga hai. Chaaho to kisi external scheduler se exact **19:23 IST** par ping karwa sakte ho — trigger turant start hota hai (queue wait nahi):
+Workflow mein `repository_dispatch: daily-sweep` trigger pehle se laga hai. Chaaho to kisi external scheduler se exact **20:23 IST** par ping karwa sakte ho — trigger turant start hota hai (queue wait nahi):
 
 1. GitHub par ek **Personal Access Token** banao (Settings → Developer settings → Personal access tokens → fine-grained, sirf is repo ka **Contents: Read & Write** aur **Actions** access kaafi hai).
-2. [cron-job.org](https://cron-job.org) (free) par daily job banao — **19:23 IST**, POST request:
+2. [cron-job.org](https://cron-job.org) (free) par daily job banao — **20:23 IST**, POST request:
    - URL: `https://api.github.com/repos/abhayv7272/Daily-sweep/dispatches`
    - Headers: `Authorization: Bearer <TOKEN>`, `Accept: application/vnd.github+json`
    - Body: `{"event_type": "daily-sweep"}`
