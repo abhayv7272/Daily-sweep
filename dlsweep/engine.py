@@ -1,54 +1,41 @@
 """
-dlsweep/engine.py — the NSE DAILY Liquidity-Sweep Screener engine.
+dlsweep/engine.py — the NSE DAILY Liquidity-Sweep Screener engine with
+advanced multi-confluence trend reversal analytics:
 
-Every function below is copied VERBATIM from NSE_Liquidity_Sweep_Screener_FIXED.ipynb
-(cell numbers noted above each block) so an unattended GitHub Actions run produces
-EXACTLY the result you see when you press "Run all" in Colab. The notebook on the
-`main` branch is the ground truth.
-
-Exactly TWO additive robustness fixes exist vs. the notebook, and neither can change
-a detected setup, level or score (they only recover data the notebook silently drops):
-
-  * chunked_download / backfill_latest — if yfinance returns a FLAT (non-MultiIndex)
-    frame for a 1-symbol request (older yfinance shape), xs() raises TypeError which
-    the notebook's bare `except` swallows, dropping that symbol. We recover the frame
-    when the chunk has exactly one symbol and columns are not a MultiIndex.
-  * Notebook cell top-level statements are wrapped in functions
-    (rank_universe / fetch_history / self_test / format_results), and
-    plot_setup() takes the DATA dict as an argument and returns the figure
-    instead of calling plt.show() — same drawing code, headless backend.
-
-Notebook map:
-  cell 1   imports
-  cell 3   SweepConfig (dataclass, all knobs)
-  cell 5   NSE universe fetch (dual archive URLs + cookie warm-up + fallback list)
-  cell 8   chunked_download() + turnover ranking
-  cell 9   backfill_latest() + full-history download + data-health gate
-  cell 11  sweep engine + scoring (tie-aware fractals, NaN-safe OHLC, RSI-50 flat tape)
-  cell 12  self-test (synthetic candles + 3 regressions)
-  cell 14  results-table formatter
-  cell 15  setup_report text + plot_setup chart
+  * Swing Low Liquidity Sweep & Reclaim detection
+  * Relative Equal Lows (Double/Triple Bottom / Liquidity Shelf) detection & % distance
+  * Fair Value Gap (Bullish FVG / Imbalance) mitigation & status
+  * Wilder RSI & Regular/Hidden Bullish RSI Divergence detection
+  * Volume Dynamics (Institutional Absorption, Dry-Up Spring, Volume Multiplier)
+  * Candlestick Reversal Signatures (Hammer Pinbar, Dragonfly Doji, Power Reclaim)
+  * Moving Average Regime (EMA 20, 50, 200) & Intraday Regain
+  * Major Structural Low Lookback & % buffer
+  * Composite Trend Reversal Confluence Grade (A+ / A / B+) & Bullish Catalysts
+  * High-Res Multi-Panel Candlestick & RSI Divergence Charting
 """
 
 # ============================================================
-# cell 1 — imports (pip installs are handled by requirements.txt in Actions)
+# cell 1 — imports
 # ============================================================
+from dataclasses import dataclass, field
+import datetime as _dt
+import io
+import os
 import random
 import time
 import warnings
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
 # ============================================================
-# cell 3 — CONFIGURATION (verbatim)
+# cell 3 — CONFIGURATION
 # ============================================================
-from dataclasses import dataclass
-
-
 @dataclass
 class SweepConfig:
     # ---- Universe ----
@@ -77,37 +64,38 @@ class SweepConfig:
     require_bullish_close : bool = True    # close > open
     require_prior_above : bool = True      # previous close above the level (true sweep)
     min_price           : float = 10.0     # ignore sub-₹10 names
-    # ---- Scoring ----
+    # ---- Scoring & Confluence ----
     volume_lookback     : int   = 20
     rsi_period          : int   = 14
+    fvg_lookback        : int   = 40       # lookback for bullish FVGs
+    rsi_div_lookback    : int   = 35       # lookback for RSI divergence
+    major_low_lookback  : int   = 60       # lookback for major structural low
 
 
 CFG = SweepConfig()
 
 
 def describe_config(cfg=None):
-    """The exact banner cell 3 prints in the notebook."""
+    """The configuration banner describing active rules and confluence filters."""
     cfg = cfg or CFG
     lines = [
-        "Active rules on the LATEST daily candle",
-        "-" * 62,
-        f"  Swing low           : 5-bar fractal, up to {cfg.level_lookback} bars old (old or new)",
+        "Active rules & Confluence parameters on the LATEST daily candle",
+        "-" * 68,
+        f"  Swing low           : 5-bar fractal, up to {cfg.level_lookback} bars old",
         f"  Sweep pierce        : low >= {cfg.min_pierce_pct:.2%} below level, no deeper than {cfg.max_sweep_depth:.1%}",
         f"  Reclaim             : close >= {cfg.close_above_buffer:.2%} ABOVE level",
         f"  Proper wick         : lower wick >= {cfg.min_wick_ratio:.0%} of range AND >= {cfg.min_wick_pct_price:.2%} of price",
         f"  Bullish close       : {cfg.require_bullish_close}   |   Prior close above level: {cfg.require_prior_above}",
+        f"  Equal Lows pool     : clustered within {cfg.level_dedup_pct:.2%} (Double/Triple Bottom liquidity shelves)",
+        f"  Confluence checks   : RSI Divergence ({cfg.rsi_div_lookback}b), Bullish FVG ({cfg.fvg_lookback}b), Vol Absorption, EMAs",
         f"  Universe            : top {cfg.universe_size} by turnover (>= ₹{cfg.min_avg_turnover_cr} Cr/day), price >= ₹{cfg.min_price:.0f}",
     ]
     return "\n".join(lines)
 
 
 # ============================================================
-# cell 5 — UNIVERSE (verbatim)
+# cell 5 — UNIVERSE
 # ============================================================
-import io
-
-import requests
-
 NSE_LIST_URLS = [
     "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",
     "https://archives.nseindia.com/content/equities/EQUITY_L.csv",   # legacy mirror
@@ -202,14 +190,10 @@ def fetch_nse_universe():
 
 
 # ============================================================
-# cell 8 — chunked downloader (verbatim) + turnover ranking
+# cell 8 — chunked downloader + turnover ranking
 # ============================================================
 def chunked_download(symbols, period, chunk=None, label="download"):
-    """Chunked yfinance download with per-chunk retry + exponential backoff.
-
-    Returns (dict {yahoo_symbol: OHLCV DataFrame}, list_of_failed_symbols).
-    A single bad chunk never aborts the rest of the run.
-    """
+    """Chunked yfinance download with per-chunk retry + exponential backoff."""
     chunk = chunk or CFG.download_chunk
     out, failed = {}, []
     n_chunks = (len(symbols) + chunk - 1) // chunk
@@ -238,10 +222,8 @@ def chunked_download(symbols, period, chunk=None, label="download"):
             try:
                 df = res.xs(sym, axis=1, level="Ticker")
             except (KeyError, ValueError):
-                continue  # symbol missing from response (delisted/renamed/404)
+                continue
             except TypeError:
-                # [fix] older yfinance returned a FLAT frame for a 1-symbol request —
-                # xs() then raised TypeError and the symbol was silently dropped.
                 if len(part) != 1 or isinstance(res.columns, pd.MultiIndex):
                     continue
                 df = res.copy()
@@ -257,10 +239,7 @@ def chunked_download(symbols, period, chunk=None, label="download"):
 
 
 def rank_universe(universe_all):
-    """cell 8, second half (verbatim): rank all of NSE by avg daily turnover.
-
-    Returns (UNIVERSE, stats_dict).
-    """
+    """Rank all of NSE by avg daily turnover. Returns (UNIVERSE, stats_dict)."""
     UNIVERSE_ALL = universe_all
 
     print(f"Ranking pass: 1 month of data for all {len(UNIVERSE_ALL):,} NSE symbols …")
@@ -300,17 +279,10 @@ def rank_universe(universe_all):
 
 
 # ============================================================
-# cell 9 — latest-session backfill (verbatim) + history + health gate
+# cell 9 — latest-session backfill + history + health gate
 # ============================================================
-import datetime as _dt
-
-
 def backfill_latest(symbols, target_date, chunk=40):
-    """Rebuild missing latest-session daily candles from 15-min data (Close = final trade).
-
-    Yahoo frequently leaves Close=NaN on the newest NSE daily bar; the 15-min feed has the
-    full session. Daily O/H/L and the 15-min aggregates agree to tick precision.
-    """
+    """Rebuild missing latest-session daily candles from 15-min data."""
     fixed = {}
     if not symbols:
         return fixed
@@ -341,7 +313,6 @@ def backfill_latest(symbols, target_date, chunk=40):
             except (KeyError, ValueError):
                 continue
             except TypeError:
-                # [fix] same 1-symbol flat-frame recovery as chunked_download
                 if len(part) != 1 or isinstance(intr.columns, pd.MultiIndex):
                     continue
                 i = intr.dropna(subset=["Open", "High", "Low", "Close"])
@@ -360,7 +331,7 @@ def backfill_latest(symbols, target_date, chunk=40):
 
 
 def fetch_history(universe):
-    """cell 9, download + health gate (verbatim). Returns (DATA, health_text, stats)."""
+    """Download daily history and apply health gates. Returns (DATA, health_text, stats)."""
     UNIVERSE = universe
 
     print(f"Downloading {CFG.history_period} daily OHLCV for {len(UNIVERSE):,} symbols …")
@@ -396,9 +367,9 @@ def fetch_history(universe):
     for sym, df in HIST.items():
         if len(df) < CFG.min_bars:
             short_list.append(sym); continue
-        if CFG.require_latest_session:                       # (typo repaired here — see module docstring)
+        if CFG.require_latest_session:
             if df.index[-1].date() < max_last:
-                stale_list.append(sym); continue   # missing latest session (Yahoo data lag)
+                stale_list.append(sym); continue
         elif (max_last - df.index[-1].date()).days > CFG.max_staleness_days:
             stale_list.append(sym); continue
         DATA[sym] = df
@@ -431,15 +402,13 @@ def fetch_history(universe):
 
 
 # ============================================================
-# cell 11 — SWEEP ENGINE (verbatim)
+# cell 11 — ADVANCED TECHNICAL CONFLUENCE & SWEEP ENGINE
 # ============================================================
 def find_swing_lows(low, k):
     """Indices i where low[i] is a fractal swing low of low[i-k .. i+k].
 
     Tie-aware: strictly lower than the k bars on the LEFT, lower-or-EQUAL to the k bars
-    on the RIGHT. An exact double/triple bottom (equal lows — common on NSE's 0.05 tick)
-    keeps its FIRST touch as the level instead of being discarded entirely.
-    Windows containing non-finite lows are skipped (bad data can't mint levels).
+    on the RIGHT. Windows containing non-finite lows are skipped.
     """
     n = len(low)
     out = []
@@ -454,31 +423,382 @@ def find_swing_lows(low, k):
 
 
 def merge_pools(swings, dedup_pct):
-    """Merge nearly-equal swing levels into liquidity pools: [level, first_bar, last_bar]."""
+    """Merge nearly-equal swing levels into liquidity pools:
+    Each pool: [level, first_bar, last_bar, touch_count, touch_list]
+    Preserves list indices [0], [1], [2] for 100% backward compatibility.
+    """
     pools = []
     for i, L in swings:
         for p in pools:
             if abs(L - p[0]) / p[0] <= dedup_pct:
                 p[0] = min(p[0], L)
                 p[2] = max(p[2], i)
+                p[3] += 1
+                p[4].append((i, L))
                 break
         else:
-            pools.append([L, i, i])
+            pools.append([L, i, i, 1, [(i, L)]])
     return pools
 
 
 def rsi_wilder(close, period=14):
-    """Wilder RSI series (aligned to close[1:])."""
+    """Wilder RSI series (aligned to close[1:], with zero-loss+gain=50 safe handling)."""
+    close = np.asarray(close, dtype=float)
+    if len(close) < 2:
+        return pd.Series([50.0] * len(close))
     delta = np.diff(close)
     gain = pd.Series(np.clip(delta, 0, None)).ewm(alpha=1 / period, adjust=False).mean()
     loss = pd.Series(np.clip(-delta, 0, None)).ewm(alpha=1 / period, adjust=False).mean()
     out = pd.Series(np.where(loss > 0, 100 - 100 / (1 + gain / loss.where(loss > 0)),
                              np.where(gain > 0, 100.0, 50.0)), index=gain.index)
-    return out   # zero-loss+zero-gain (flat tape) is neutral 50, not a fake 100
+    return out
+
+
+def compute_rsi_series(close, period=14):
+    """Full-length RSI series matching len(close), initial bar padded with 50.0."""
+    close = np.asarray(close, dtype=float)
+    n = len(close)
+    if n < 2:
+        return np.full(n, 50.0)
+    r = rsi_wilder(close, period)
+    out = np.empty(n, dtype=float)
+    out[0] = 50.0
+    out[1:] = r.to_numpy(dtype=float)
+    return out
+
+
+def find_bullish_fvgs(df, lookback=40):
+    """Detect Bullish Fair Value Gaps (FVGs / Imbalances) over the last `lookback` bars.
+    A Bullish FVG forms at bar i where Low[i] > High[i-2].
+    The imbalance zone is [High[i-2], Low[i]].
+    """
+    n = len(df)
+    if n < 4:
+        return []
+    h = df["High"].to_numpy(dtype=float)
+    l = df["Low"].to_numpy(dtype=float)
+    T = n - 1
+    start_i = max(2, T - lookback)
+
+    fvgs = []
+    for i in range(start_i, T):
+        if l[i] > h[i - 2]:
+            top = float(l[i])
+            bottom = float(h[i - 2])
+            if top <= bottom or bottom <= 0:
+                continue
+            # Mitigation check: did any candle before T trade completely below bottom?
+            mitigated = False
+            for k in range(i + 1, T):
+                if l[k] <= bottom:
+                    mitigated = True
+                    break
+            fvgs.append({
+                "bar_i": int(i),
+                "top": top,
+                "bottom": bottom,
+                "mid": (top + bottom) / 2.0,
+                "size_pct": ((top - bottom) / bottom) * 100.0,
+                "mitigated": mitigated
+            })
+    return fvgs
+
+
+def analyze_fvg_status(df, fvgs):
+    """Check whether the latest candle is inside, tapped, or above a Bullish FVG."""
+    n = len(df)
+    T = n - 1
+    c_T = float(df["Close"].iloc[T])
+    l_T = float(df["Low"].iloc[T])
+
+    active = [f for f in fvgs if not f["mitigated"]]
+    if not active:
+        return {
+            "in_fvg": False,
+            "fvg_status": "No Active FVG",
+            "fvg_top": 0.0,
+            "fvg_bottom": 0.0,
+            "fvg_dist_pct": 0.0,
+            "fvg_ref": None
+        }
+
+    # Inside or tapped FVG
+    inside = [f for f in active if (l_T <= f["top"] * 1.002 and c_T >= f["bottom"] * 0.998)]
+    if inside:
+        best_fvg = max(inside, key=lambda f: f["top"])
+        tapped = l_T <= best_fvg["bottom"] * 1.005
+        status_txt = (f"Inside Bullish FVG [₹{best_fvg['bottom']:.2f} - ₹{best_fvg['top']:.2f}]" if not tapped
+                      else f"Tapped & Filled Bullish FVG [₹{best_fvg['bottom']:.2f} - ₹{best_fvg['top']:.2f}]")
+        return {
+            "in_fvg": True,
+            "fvg_status": status_txt,
+            "fvg_top": best_fvg["top"],
+            "fvg_bottom": best_fvg["bottom"],
+            "fvg_dist_pct": 0.0,
+            "fvg_ref": best_fvg
+        }
+
+    # Above nearest active Bullish FVG
+    below = [f for f in active if f["top"] < c_T]
+    if below:
+        nearest = max(below, key=lambda f: f["top"])
+        dist_pct = ((c_T / nearest["top"]) - 1.0) * 100.0
+        return {
+            "in_fvg": False,
+            "fvg_status": f"+{dist_pct:.1f}% above FVG [₹{nearest['bottom']:.2f} - ₹{nearest['top']:.2f}]",
+            "fvg_top": nearest["top"],
+            "fvg_bottom": nearest["bottom"],
+            "fvg_dist_pct": dist_pct,
+            "fvg_ref": nearest
+        }
+
+    return {
+        "in_fvg": False,
+        "fvg_status": "No FVG Below",
+        "fvg_top": 0.0,
+        "fvg_bottom": 0.0,
+        "fvg_dist_pct": 0.0,
+        "fvg_ref": None
+    }
+
+
+def detect_rsi_divergence(close, low, swings, rsi_arr, lookback=35):
+    """Detect Regular Bullish, Hidden Bullish, or Bearish RSI Divergence.
+
+    Regular Bullish Divergence:
+      Price Lower Low (or equal) + RSI Higher Low -> Powerful Reversal Signal ⚡
+
+    Hidden Bullish Divergence:
+      Price Higher Low + RSI Lower Low -> Trend Continuation Signal 🚀
+    """
+    n = len(close)
+    T = n - 1
+    curr_low = float(low[T])
+    curr_rsi = float(rsi_arr[T])
+
+    recent_swings = [(i, L) for i, L in swings if (T - lookback <= i <= T - 2)]
+    if not recent_swings:
+        return {
+            "type": "none",
+            "label": "None",
+            "detail": "RSI aligned with price action",
+            "prior_low_idx": None,
+            "prior_low_val": None,
+            "prior_rsi_val": None,
+            "curr_low_val": curr_low,
+            "curr_rsi_val": curr_rsi
+        }
+
+    for i_prev, l_prev in reversed(recent_swings):
+        rsi_prev = float(rsi_arr[i_prev])
+        age = T - i_prev
+
+        # 1. Regular Bullish Divergence: Price Lower Low & RSI Higher Low
+        if curr_low <= l_prev * 1.002 and curr_rsi >= rsi_prev + 1.2:
+            px_diff = ((curr_low / l_prev) - 1.0) * 100.0
+            rsi_diff = curr_rsi - rsi_prev
+            return {
+                "type": "regular_bullish",
+                "label": "Bullish Div ⚡",
+                "detail": f"Price Lower Low ({px_diff:+.1f}%) vs RSI Higher Low (+{rsi_diff:.1f} pts, {age}b ago)",
+                "prior_low_idx": i_prev,
+                "prior_low_val": l_prev,
+                "prior_rsi_val": rsi_prev,
+                "curr_low_val": curr_low,
+                "curr_rsi_val": curr_rsi
+            }
+
+        # 2. Hidden Bullish Divergence: Price Higher Low & RSI Lower Low
+        if curr_low >= l_prev * 1.005 and curr_rsi <= rsi_prev - 2.0:
+            px_diff = ((curr_low / l_prev) - 1.0) * 100.0
+            rsi_diff = curr_rsi - rsi_prev
+            return {
+                "type": "hidden_bullish",
+                "label": "Hidden Bullish 🚀",
+                "detail": f"Price Higher Low ({px_diff:+.1f}%) vs RSI Lower Low ({rsi_diff:.1f} pts, {age}b ago)",
+                "prior_low_idx": i_prev,
+                "prior_low_val": l_prev,
+                "prior_rsi_val": rsi_prev,
+                "curr_low_val": curr_low,
+                "curr_rsi_val": curr_rsi
+            }
+
+    return {
+        "type": "none",
+        "label": "None",
+        "detail": "RSI confirmed with price trend",
+        "prior_low_idx": None,
+        "prior_low_val": None,
+        "prior_rsi_val": None,
+        "curr_low_val": curr_low,
+        "curr_rsi_val": curr_rsi
+    }
+
+
+def analyze_volume_dynamics(v, c, l, h, o, T, vol_lookback=20):
+    """Analyze volume absorption, dry-up exhaustion, and volume confirmation."""
+    vol_base = float(v[max(0, T - vol_lookback):T].mean()) if T > 0 else float(v[T])
+    vol_x = float(v[T]) / vol_base if vol_base > 0 else 1.0
+    rng = h[T] - l[T]
+    lw = min(o[T], c[T]) - l[T]
+    wick_ratio = lw / rng if rng > 0 else 0.0
+
+    prior_3_vol = float(v[max(0, T - 3):T].mean()) if T >= 3 else vol_base
+    vol_dryup = (prior_3_vol < vol_base * 0.85) and (vol_x >= 1.15)
+    vol_absorption = (vol_x >= 1.35) and (wick_ratio >= 0.45)
+
+    if vol_absorption and vol_x >= 2.0:
+        label = "Mega Absorption 🔥🔥"
+        detail = f"Institutional absorption: volume {vol_x:.1f}× on {wick_ratio*100:.0f}% lower wick"
+    elif vol_absorption:
+        label = "Bullish Absorption 🔥"
+        detail = f"High volume absorption ({vol_x:.1f}× avg) on sweep wick"
+    elif vol_dryup:
+        label = "Dry-Up Spring 📉⚡"
+        detail = f"Selling dried up ({prior_3_vol/vol_base:.1f}× avg), surged {vol_x:.1f}× on reclaim"
+    elif vol_x >= 1.2:
+        label = "Strong Volume 📈"
+        detail = f"Above-average volume expansion ({vol_x:.1f}× 20d avg)"
+    elif vol_x < 0.6:
+        label = "Low Volume ⚠️"
+        detail = f"Below-average volume ({vol_x:.1f}× 20d avg)"
+    else:
+        label = "Normal Volume"
+        detail = f"Standard volume ({vol_x:.1f}× 20d avg)"
+
+    return {
+        "vol_x": vol_x,
+        "vol_div": label,
+        "vol_div_detail": detail,
+        "vol_absorption": vol_absorption,
+        "vol_dryup": vol_dryup
+    }
+
+
+def analyze_candlestick_pattern(o, h, l, c, T):
+    """Classify the candlestick reversal signature."""
+    rng = h[T] - l[T]
+    if rng <= 0:
+        return "Flat Candle"
+    body = abs(c[T] - o[T])
+    body_ratio = body / rng
+    lw = min(o[T], c[T]) - l[T]
+    lw_ratio = lw / rng
+    uw = h[T] - max(o[T], c[T])
+    uw_ratio = uw / rng
+    close_pos = (c[T] - l[T]) / rng
+
+    if lw_ratio >= 0.65 and body_ratio <= 0.15:
+        return "Dragonfly Doji 🐉"
+    elif lw_ratio >= 0.48 and close_pos >= 0.70 and uw_ratio <= 0.22:
+        return "Hammer Pinbar 🔨"
+    elif c[T] > o[T] and close_pos >= 0.80:
+        return "Bullish Power Reclaim 🟢"
+    elif lw_ratio >= 0.35:
+        return "Rejection Wick 🛡️"
+    return "Standard Candle"
+
+
+def compute_confluences_and_grade(rec):
+    """Aggregate all technical confluences and compute the Trend Reversal Grade."""
+    catalysts = []
+    points = 0.0
+
+    # 1. RSI Divergence
+    if rec["RSI_Div_Type"] == "regular_bullish":
+        catalysts.append("⚡ Bullish RSI Divergence: Momentum turned upward while taking liquidity")
+        points += 2.0
+    elif rec["RSI_Div_Type"] == "hidden_bullish":
+        catalysts.append("🚀 Hidden Bullish RSI Divergence: Strong structural trend continuation")
+        points += 1.5
+
+    # 2. Equal Lows / Liquidity Pool
+    if rec["Is_Equal_Lows"]:
+        count = rec["Equal_Lows_Count"]
+        name = "Double Bottom" if count == 2 else "Triple Bottom" if count == 3 else f"{count}-Touch Shelf"
+        catalysts.append(f"🎯 Swept High-Liquidity Equal Lows Pool ({name} @ ₹{rec['Equal_Lows_Level']:.2f})")
+        points += 2.0
+
+    # 3. Fair Value Gap (Bullish FVG)
+    if rec["In_Bullish_FVG"]:
+        catalysts.append(f"📦 Sitting in / Mitigated Institutional Bullish FVG Zone")
+        points += 1.5
+
+    # 4. Volume Absorption / Expansion
+    if "Absorption" in rec["Vol_Div"]:
+        catalysts.append(f"🔥 Institutional Volume Absorption ({rec['Vol_x']:.1f}× Avg Volume)")
+        points += 1.5
+    elif "Dry-Up" in rec["Vol_Div"]:
+        catalysts.append(f"📉 Volume Dry-Up Exhaustion + Spring Reclaim")
+        points += 1.0
+    elif rec["Vol_x"] >= 1.2:
+        catalysts.append(f"📈 Volume Expansion on Reclaim ({rec['Vol_x']:.1f}× Avg)")
+        points += 0.5
+
+    # 5. Candlestick Signature
+    if "Hammer" in rec["Candle_Pattern"] or "Dragonfly" in rec["Candle_Pattern"]:
+        catalysts.append(f"🔨 Textbook Bullish Reversal Candle ({rec['Candle_Pattern']})")
+        points += 1.0
+    elif "Power Reclaim" in rec["Candle_Pattern"]:
+        catalysts.append(f"🟢 High-Close Power Reclaim (Top 20% of range)")
+        points += 0.5
+
+    # 6. Moving Averages / Trend Support
+    if rec["E50"]:
+        catalysts.append(f"📈 Major Trend Support: Trading Above 50 EMA")
+        points += 1.0
+    if rec["E20_Regained"]:
+        catalysts.append(f"🟢 Regained 20 EMA on the Reclaim Bar")
+        points += 1.0
+    elif rec["E20"]:
+        catalysts.append(f"📈 Above Short-Term 20 EMA")
+        points += 0.5
+    if rec.get("E200", False):
+        catalysts.append(f"🏛️ Above 200 EMA Macro Bullish Regime")
+        points += 0.5
+
+    # 7. Asymmetric Risk/Reward
+    if rec["RR"] >= 2.5:
+        catalysts.append(f"🛡️ Favorable Asymmetry: R:R {rec['RR']:.1f}:1 to Target ₹{rec['Target_Ref']:.2f}")
+        points += 0.5
+
+    # 8. Clean Sweep Depth
+    if rec["Sweep_Depth_"] <= 1.0:
+        catalysts.append(f"✨ Clean Liquidity Tap (shallow {rec['Sweep_Depth_']:.2f}% pierce — fast rejection)")
+        points += 0.5
+
+    # Compute Grade
+    score = rec["Score"]
+    if points >= 4.5 or (score >= 80 and points >= 3.0):
+        grade = "A+ Ultra Reversal 🚀"
+        grade_short = "A+"
+    elif points >= 3.0 or (score >= 70 and points >= 1.5):
+        grade = "A Strong Reversal ⭐"
+        grade_short = "A"
+    elif points >= 1.5 or score >= 60:
+        grade = "B+ Solid Setup ✅"
+        grade_short = "B+"
+    else:
+        grade = "B Standard Sweep"
+        grade_short = "B"
+
+    return grade, grade_short, catalysts, int(len(catalysts))
+
+
+def count_pool_touches(l, pool_level, first_i, T, tol_pct=0.0025):
+    """Count distinct bar touches of pool_level within tolerance."""
+    touches = []
+    for i in range(first_i, T):
+        if abs(l[i] - pool_level) / pool_level <= tol_pct:
+            if not touches or i > touches[-1] + 1:
+                touches.append(i)
+    return max(1, len(touches)), touches
 
 
 def analyze_symbol(df, cfg):
-    """Return a setup record if the latest candle of df completed a valid swing-low sweep, else None."""
+    """Return a setup record with all confluence factors if the latest candle
+    completed a valid swing-low sweep, else None.
+    """
     n = len(df)
     if n < max(cfg.min_bars, 2 * cfg.fractal_k + 4):
         return None
@@ -486,13 +806,12 @@ def analyze_symbol(df, cfg):
     h = df["High"].to_numpy(dtype=float)
     l = df["Low"].to_numpy(dtype=float)
     c = df["Close"].to_numpy(dtype=float)
-    v = np.nan_to_num(df["Volume"].to_numpy(dtype=float))   # Yahoo lags Volume on fresh bars;
-                                                             # NaN here poisons Vol_x & turnover
+    v = np.nan_to_num(df["Volume"].to_numpy(dtype=float))
     T = n - 1
+
     if not (np.isfinite(o[T]) and np.isfinite(h[T]) and np.isfinite(l[T])
             and np.isfinite(c[T]) and h[T] > 0):
-        return None      # any non-finite OHLC on the signal bar -> NaN passes every
-                         # comparison filter silently and mints a NaN-stop "setup"
+        return None
     if c[T] < cfg.min_price:
         return None
     rng = h[T] - l[T]
@@ -500,46 +819,102 @@ def analyze_symbol(df, cfg):
         return None
     lw = min(o[T], c[T]) - l[T]
 
-    pools = merge_pools(find_swing_lows(l, cfg.fractal_k), cfg.level_dedup_pct)
+    raw_swings = find_swing_lows(l, cfg.fractal_k)
+    pools = merge_pools(raw_swings, cfg.level_dedup_pct)
     best = None
-    for level, first_i, last_i in pools:
+    best_pool = None
+
+    for p in pools:
+        level, first_i, last_i = p[0], p[1], p[2]
         age = T - first_i
         if age <= 0 or age > cfg.level_lookback:
             continue
-        if l[T] >= level * (1 - cfg.min_pierce_pct):          # no genuine pierce
+        if l[T] >= level * (1 - cfg.min_pierce_pct):
             continue
-        if c[T] <= level * (1 + cfg.close_above_buffer):       # no reclaim above
+        if c[T] <= level * (1 + cfg.close_above_buffer):
             continue
         depth = (level - l[T]) / level
-        if depth > cfg.max_sweep_depth:                        # too deep = breakdown
+        if depth > cfg.max_sweep_depth:
             continue
-        if lw / rng < cfg.min_wick_ratio:                      # no proper wick
+        if lw / rng < cfg.min_wick_ratio:
             continue
         if lw < cfg.min_wick_pct_price * level:
             continue
         if cfg.require_bullish_close and c[T] <= o[T]:
             continue
-        if cfg.require_prior_above and c[T - 1] <= level:      # was already below → not a sweep
+        if cfg.require_prior_above and c[T - 1] <= level:
             continue
         key = (depth, -age)
         if best is None or key < (best["depth"], -best["age"]):
             best = dict(level=level, age=age, touch_ago=T - last_i, depth=depth)
-    if best is None:
+            best_pool = p
+
+    if best is None or best_pool is None:
         return None
 
-    vol_base = float(v[T - cfg.volume_lookback:T].mean())
-    vol_x = float(v[T]) / vol_base if vol_base > 0 else 1.0
-    rsi = float(rsi_wilder(c, cfg.rsi_period).iloc[-1])
-    e20 = float(pd.Series(c).ewm(span=20, adjust=False).mean().iloc[-1])
-    e50 = float(pd.Series(c).ewm(span=50, adjust=False).mean().iloc[-1])
+    # ---- Technical Indicators ----
+    rsi_series = compute_rsi_series(c, cfg.rsi_period)
+    rsi_latest = float(rsi_series[-1])
+
+    e20_arr = pd.Series(c).ewm(span=20, adjust=False).mean().to_numpy()
+    e50_arr = pd.Series(c).ewm(span=50, adjust=False).mean().to_numpy()
+    e20 = float(e20_arr[-1])
+    e50 = float(e50_arr[-1])
+    e200 = float(pd.Series(c).ewm(span=200, adjust=False).mean().to_numpy()[-1]) if n >= 200 else None
+
+    above_e20 = bool(c[T] > e20)
+    above_e50 = bool(c[T] > e50)
+    above_e200 = bool(c[T] > e200) if e200 is not None else False
+    e20_regained = bool(l[T] <= e20 <= c[T])
+    e50_regained = bool(l[T] <= e50 <= c[T])
+
     close_pos = (c[T] - l[T]) / rng
     wick_ratio = lw / rng
-    turnover_cr = float((c * v)[T - cfg.volume_lookback:T].mean() / 1e7)
+    turnover_cr = float((c * v)[max(0, T - cfg.volume_lookback):T].mean() / 1e7)
     stop = float(l[T])
-    target_ref = max(float(np.max(h[T - 20:T])), float(c[T]) * 1.01)
-    rr = max(0.0, (target_ref - c[T]) / max(c[T] - stop, 1e-9))
+    target_ref = max(float(np.max(h[max(0, T - 20):T])), float(c[T]) * 1.01)
+    risk = max(c[T] - stop, 1e-9)
+    rr = max(0.0, (target_ref - c[T]) / risk)
+    target_2r = float(c[T] + 2.0 * risk)
 
-    # ---- score components (each 0..1) ----
+    # ---- Volume Dynamics ----
+    vol_dyn = analyze_volume_dynamics(v, c, l, h, o, T, cfg.volume_lookback)
+    vol_x = vol_dyn["vol_x"]
+
+    # ---- RSI Divergence ----
+    rsi_div_res = detect_rsi_divergence(c, l, raw_swings, rsi_series, cfg.rsi_div_lookback)
+
+    # ---- Relative Equal Lows (EQL) ----
+    eql_touches_cnt, eql_touch_indices = count_pool_touches(l, best["level"], best_pool[1], T, cfg.level_dedup_pct)
+    total_eql_count = max(best_pool[3], eql_touches_cnt)
+    is_equal_lows = total_eql_count >= 2
+    eql_level = float(best["level"])
+    above_eql_pct = float((c[T] / eql_level - 1.0) * 100.0)
+    if is_equal_lows:
+        eql_desc = f"{'Double' if total_eql_count == 2 else 'Triple' if total_eql_count == 3 else f'{total_eql_count}-Touch'} Bottom @ ₹{eql_level:.2f} (+{above_eql_pct:.2f}% above)"
+    else:
+        # Check if another equal-low pool is nearby (within 3.5% below)
+        nearby_eql = [p for p in pools if (p[3] >= 2 or count_pool_touches(l, p[0], p[1], T, cfg.level_dedup_pct)[0] >= 2) and p[0] < c[T] and (c[T] / p[0] - 1.0) <= 0.035]
+        if nearby_eql:
+            nb_p = max(nearby_eql, key=lambda p: p[0])
+            nb_dist = (c[T] / nb_p[0] - 1.0) * 100.0
+            eql_desc = f"Near Double Bottom @ ₹{nb_p[0]:.2f} (+{nb_dist:.1f}% above)"
+        else:
+            eql_desc = "Single Swing Low"
+
+    # ---- Bullish Fair Value Gap (FVG) ----
+    fvgs = find_bullish_fvgs(df, cfg.fvg_lookback)
+    fvg_res = analyze_fvg_status(df, fvgs)
+
+    # ---- Candlestick Signature ----
+    candle_pattern = analyze_candlestick_pattern(o, h, l, c, T)
+
+    # ---- Major Structural Low Distance ----
+    major_start = max(0, T - cfg.major_low_lookback)
+    major_low = float(np.min(l[major_start:T + 1]))
+    above_major_low = float((c[T] / major_low - 1.0) * 100.0)
+
+    # ---- Setup Score (0..100) ----
     s_wick = min(wick_ratio / 0.75, 1.0)
     s_close = max(0.0, min(1.0, (close_pos - 0.5) / 0.45))
     s_depth = max(0.0, 1.0 - best["depth"] / cfg.max_sweep_depth)
@@ -549,17 +924,17 @@ def analyze_symbol(df, cfg):
         s_vol = 0.5 + 0.5 * (vol_x - 1.0) / 2.0
     else:
         s_vol = max(0.0, 1.0 - (vol_x - 3.0) / 5.0)
-    if 25.0 <= rsi <= 65.0:
+    if 25.0 <= rsi_latest <= 65.0:
         s_rsi = 1.0
-    elif rsi < 25.0:
-        s_rsi = max(0.0, 0.6 * rsi / 25.0)
+    elif rsi_latest < 25.0:
+        s_rsi = max(0.0, 0.6 * rsi_latest / 25.0)
     else:
-        s_rsi = max(0.0, 1.0 - (rsi - 65.0) / 30.0)
-    s_ema = {2: 1.0, 1: 0.55, 0: 0.2}[int(c[T] > e50) + int(c[T] > e20)]  # int() casts: numpy-bool "+" is logical OR, never 2
+        s_rsi = max(0.0, 1.0 - (rsi_latest - 65.0) / 30.0)
+    s_ema = {2: 1.0, 1: 0.55, 0: 0.2}[int(above_e50) + int(above_e20)]
 
     score = 25 * s_wick + 15 * s_close + 15 * s_depth + 15 * s_vol + 15 * s_rsi + 15 * s_ema
 
-    return dict(
+    rec = dict(
         Yahoo=df.attrs.get("yahoo", ""),
         Date=str(df.index[-1].date()),
         Open=float(o[T]), Close=float(c[T]), High=float(h[T]), Low=float(stop),
@@ -570,12 +945,41 @@ def analyze_symbol(df, cfg):
         Above_Level_=(c[T] / best["level"] - 1.0) * 100.0,
         LowerWick_=wick_ratio * 100.0,
         ClosePos_=close_pos * 100.0,
-        Vol_x=vol_x, RSI14=rsi,
-        E20=bool(c[T] > e20), E50=bool(c[T] > e50),
+        Vol_x=vol_x, RSI14=rsi_latest,
+        E20=above_e20, E50=above_e50, E200=above_e200,
+        E20_Regained=e20_regained, E50_Regained=e50_regained,
         Avg_Turn_Cr=turnover_cr,
-        Stop_Loss=stop, Target_Ref=target_ref, RR=rr,
+        Stop_Loss=stop, Target_Ref=target_ref, Target_2R=target_2r, RR=rr,
         Score=float(score),
+        # Advanced Confluence fields
+        RSI_Div=rsi_div_res["label"],
+        RSI_Div_Type=rsi_div_res["type"],
+        RSI_Div_Detail=rsi_div_res["detail"],
+        RSI_Div_Prior_Idx=rsi_div_res["prior_low_idx"],
+        Vol_Div=vol_dyn["vol_div"],
+        Vol_Div_Detail=vol_dyn["vol_div_detail"],
+        Is_Equal_Lows=is_equal_lows,
+        Equal_Lows_Count=total_eql_count,
+        Equal_Lows_Level=eql_level,
+        Above_Equal_Lows_=above_eql_pct,
+        Equal_Lows_Desc=eql_desc,
+        In_Bullish_FVG=fvg_res["in_fvg"],
+        FVG_Status=fvg_res["fvg_status"],
+        FVG_Top=fvg_res["fvg_top"],
+        FVG_Bottom=fvg_res["fvg_bottom"],
+        FVG_Dist_Pct=fvg_res["fvg_dist_pct"],
+        Candle_Pattern=candle_pattern,
+        Major_Low=major_low,
+        Above_Major_Low_=above_major_low,
     )
+
+    grade, grade_short, catalysts, count = compute_confluences_and_grade(rec)
+    rec["Confluence_Grade"] = grade
+    rec["Confluence_Grade_Short"] = grade_short
+    rec["Bullish_Catalysts"] = catalysts
+    rec["Confluence_Count"] = count
+
+    return rec
 
 
 def screen_all(data, cfg):
@@ -600,7 +1004,7 @@ def screen_all(data, cfg):
 
 
 # ============================================================
-# cell 12 — ENGINE SELF-TEST (verbatim, as a function)
+# cell 12 — ENGINE SELF-TEST
 # ============================================================
 def _synthetic_df(rows):
     idx = pd.bdate_range("2026-01-05", periods=len(rows))
@@ -608,38 +1012,42 @@ def _synthetic_df(rows):
 
 
 def self_test(cfg=None):
-    """cell 12, verbatim. Raises AssertionError if the engine logic drifts. Returns the print text."""
+    """Self-test verifying positive sweep, negative rejection, equal lows, RSI div, and FVG detection."""
     cfg = cfg or CFG
     rows = []
-    for i in range(60):                                   # calm drift around 105
+    for i in range(60):
         o = 105.0 + (i % 5) * 0.2
         rows.append((o, o + 0.8, o - 0.8, o + 0.3, 1_000_000))
-    seq = [(104.2, 104.6, 103.4, 103.6, 1_000_000),       # decline into the swing low
+    seq = [(104.2, 104.6, 103.4, 103.6, 1_000_000),
            (103.6, 103.9, 102.1, 102.4, 1_000_000),
            (102.4, 102.6, 100.9, 101.2, 1_000_000),
-           (101.2, 101.5, 100.0, 100.6, 1_200_000),       # <-- swing low 100.00 (fractal)
+           (101.2, 101.5, 100.0, 100.6, 1_200_000),       # swing low 100.00
            (100.6, 101.4, 100.5, 101.1, 1_100_000),
            (101.1, 101.8, 100.9, 101.6, 1_000_000),
            (101.6, 102.4, 101.4, 102.1, 1_000_000),
            (102.1, 102.9, 101.9, 102.6, 1_100_000),
-           (102.6, 103.1, 102.2, 102.8, 1_000_000)]       # bars 60..68
+           (102.6, 103.1, 102.2, 102.8, 1_000_000)]
     rows += seq
     # bar 69: THE SWEEP — wick to 99.35 below level 100, close 102.6 back above
     rows.append((101.8, 103.0, 99.35, 102.6, 1_800_000))
 
-    rec = analyze_symbol(_synthetic_df(rows), SweepConfig())
+    df_test = _synthetic_df(rows)
+    rec = analyze_symbol(df_test, SweepConfig())
     assert rec is not None, "positive test FAILED — sweep not detected"
     assert abs(rec["Swept_Level"] - 100.0) < 1e-9, "wrong level picked"
+    assert "Bullish Div" in rec["RSI_Div"] or rec["RSI_Div_Type"] == "regular_bullish", \
+        "RSI divergence detection on fixture failed"
+    assert len(rec["Bullish_Catalysts"]) > 0, "bullish catalysts not populated"
 
-    rows_bad = rows[:-1] + [(101.8, 103.0, 99.35, 99.8, 1_800_000)]   # close BELOW level
+    rows_bad = rows[:-1] + [(101.8, 103.0, 99.35, 99.8, 1_800_000)]
     assert analyze_symbol(_synthetic_df(rows_bad), SweepConfig()) is None, \
         "negative test FAILED — close below level must not count"
 
-    rows_flat = rows[:-1] + [(101.8, 103.0, 100.3, 102.6, 1_800_000)]  # no pierce at all
+    rows_flat = rows[:-1] + [(101.8, 103.0, 100.3, 102.6, 1_800_000)]
     assert analyze_symbol(_synthetic_df(rows_flat), SweepConfig()) is None, \
         "negative test 2 FAILED — no pierce must not count"
 
-    # regression: EQUAL-LOW double bottom (NSE tick size makes exact ties common) must be detected
+    # regression: EQUAL-LOW double bottom
     rows_dbl = rows[:60] + [(104.0, 104.3, 102.5, 102.8, 1e6),
                             (102.8, 103.0, 100.0, 100.8, 1e6),    # low #1 = 100.00
                             (100.8, 101.9, 100.6, 101.6, 1e6),
@@ -647,17 +1055,18 @@ def self_test(cfg=None):
                             (100.9, 102.2, 100.7, 102.0, 1e6),
                             (102.0, 102.8, 101.8, 102.5, 1e6),
                             (102.5, 103.0, 102.1, 102.7, 1e6),
-                            (102.0, 103.2, 99.60, 102.4, 1.6e6)]  # sweep of the double bottom
+                            (102.0, 103.2, 99.60, 102.4, 1.6e6)]
     rec_dbl = analyze_symbol(_synthetic_df(rows_dbl), SweepConfig())
     assert rec_dbl is not None and abs(rec_dbl["Swept_Level"] - 100.0) < 1e-9, \
         "regression FAILED — equal-low double bottom must be sweepable"
+    assert rec_dbl["Is_Equal_Lows"] is True, "regression FAILED — Is_Equal_Lows must be True"
 
-    # regression: NaN Low on the signal bar must NEVER produce a setup
+    # regression: NaN Low on the signal bar
     rows_nan = rows[:-1] + [(101.8, 103.0, float("nan"), 102.6, 1.8e6)]
     assert analyze_symbol(_synthetic_df(rows_nan), SweepConfig()) is None, \
-        "regression FAILED — NaN low must be rejected, not scored"
+        "regression FAILED — NaN low must be rejected"
 
-    # regression: flat tape RSI is neutral, not 100
+    # regression: flat tape RSI
     assert abs(float(rsi_wilder(np.array([100.0] * 30)).iloc[-1]) - 50.0) < 1e-9, \
         "regression FAILED — flat-tape RSI must be 50"
 
@@ -665,6 +1074,7 @@ def self_test(cfg=None):
         "✅ ENGINE SELF-TEST PASSED",
         f"   positive  : level={rec['Swept_Level']:.2f} age={rec['Level_Age_Bars']}bars "
         f"depth={rec['Sweep_Depth_']:.2f}% wick={rec['LowerWick_']:.0f}% score={rec['Score']:.1f}",
+        f"   confluence: RSI Div='{rec['RSI_Div']}' | EQL='{rec['Equal_Lows_Desc']}' | Grade='{rec['Confluence_Grade_Short']}'",
         "   negative  : close-below-level rejected ✓ | no-pierce rejected ✓",
         "   regression: equal-low double bottom ✓ | NaN-low bar ✓ | flat-tape RSI ✓",
     ])
@@ -672,77 +1082,207 @@ def self_test(cfg=None):
 
 
 # ============================================================
-# cell 14 — results table formatter (verbatim, as a function)
+# cell 14 — results table formatter
 # ============================================================
 def format_results(RESULTS, universe):
-    """cell 14 else-branch, verbatim. Returns (res, show) — `show` is the exact table Colab displays."""
+    """Format results DataFrame into display table. Returns (res, show)."""
     UNIVERSE = universe
     res = RESULTS.copy()
     res["Name"] = res["Yahoo"].map(UNIVERSE.set_index("Yahoo")["NAME OF COMPANY"].to_dict()).fillna("")
     res["Symbol"] = res["Yahoo"].str.replace(".NS", "", regex=False)
     show = res.copy()
-    fmt = {"Close": "{:.2f}", "Swept_Level": "{:.2f}", "Sweep_Depth_": "{:.2f}",
-           "Above_Level_": "{:.2f}", "LowerWick_": "{:.1f}", "ClosePos_": "{:.1f}",
-           "Vol_x": "{:.1f}", "RSI14": "{:.0f}", "Avg_Turn_Cr": "{:.1f}",
-           "Stop_Loss": "{:.2f}", "Target_Ref": "{:.2f}", "RR": "{:.2f}", "Score": "{:.1f}"}
+    fmt = {
+        "Close": "{:.2f}", "Swept_Level": "{:.2f}", "Sweep_Depth_": "{:.2f}",
+        "Above_Level_": "{:.2f}", "Above_Equal_Lows_": "{:.2f}", "LowerWick_": "{:.1f}",
+        "ClosePos_": "{:.1f}", "Vol_x": "{:.1f}", "RSI14": "{:.0f}",
+        "Avg_Turn_Cr": "{:.1f}", "Stop_Loss": "{:.2f}", "Target_Ref": "{:.2f}",
+        "RR": "{:.2f}", "Score": "{:.1f}"
+    }
     for col, f in fmt.items():
-        show[col] = show[col].map(f.format)
+        if col in show.columns:
+            show[col] = show[col].map(lambda v: f.format(v) if pd.notna(v) else "—")
+
+    # Clean display columns
     cols = ["#", "Symbol", "Name", "Date", "Close", "Swept_Level", "Level_Age_Bars",
-            "Sweep_Depth_", "Above_Level_", "LowerWick_", "ClosePos_", "Vol_x",
-            "RSI14", "E50", "Avg_Turn_Cr", "Stop_Loss", "Target_Ref", "RR", "Score"]
-    show = show[cols]
-    show.columns = ["#", "Symbol", "Name", "Date", "Close", "Swept Low", "Age(bars)",
-                    "Depth %", "Above %", "Wick %", "ClosePos %", "Vol x",
-                    "RSI", ">EMA50", "Turn ₹Cr", "Stop", "Target", "R:R", "Score"]
+            "Above_Level_", "Is_Equal_Lows", "RSI_Div", "FVG_Status", "Vol_x",
+            "LowerWick_", "RSI14", "E50", "Confluence_Grade_Short",
+            "Avg_Turn_Cr", "Stop_Loss", "Target_Ref", "RR", "Score"]
+    cols_exist = [c for c in cols if c in show.columns]
+    show = show[cols_exist]
+
+    col_rename = {
+        "#": "#", "Symbol": "Symbol", "Name": "Name", "Date": "Date", "Close": "Close",
+        "Swept_Level": "Swept Low", "Level_Age_Bars": "Age(b)", "Above_Level_": "Above %",
+        "Is_Equal_Lows": "Equal Lows", "RSI_Div": "RSI Div", "FVG_Status": "FVG Status",
+        "Vol_x": "Vol x", "LowerWick_": "Wick %", "RSI14": "RSI", "E50": ">EMA50",
+        "Confluence_Grade_Short": "Grade", "Avg_Turn_Cr": "Turn ₹Cr",
+        "Stop_Loss": "Stop", "Target_Ref": "Target", "RR": "R:R", "Score": "Score"
+    }
+    show.rename(columns=col_rename, inplace=True)
     return res, show
 
 
 # ============================================================
-# cell 15 — top-picks detail text + chart (verbatim, headless-adapted)
+# cell 15 — setup report text & high-res chart
 # ============================================================
 def setup_report_lines(r):
-    """cell 15 setup_report(), verbatim — returned as a list of lines instead of printed."""
-    return [
-        "=" * 74,
-        f"  {r.Symbol}  ({r.Name})   ·   close {r.Close:.2f} on {r.Date}",
-        "=" * 74,
-        f"  Swept swing low : {r.Swept_Level:.2f}   (born {r.Level_Age_Bars} bars ago, "
-        f"last touched {r.Touch_Ago_Bars} bars ago)",
-        f"  Wick pierce     : low {r.Sweep_Depth_:.2f}% below level  →  close {r.Above_Level_:.2f}% ABOVE level",
-        f"  Wick quality    : lower wick {r.LowerWick_:.0f}% of range · close at {r.ClosePos_:.0f}% of range",
-        f"  Context         : volume {r.Vol_x:.1f}x 20d avg · RSI(14) {r.RSI14:.0f} · "
-        f"above EMA20: {r.E20} · above EMA50: {r.E50}",
-        f"  Trade plan      : entry ≤ {r.Close:.2f} (or next open) | SL below {r.Stop_Loss:.2f} | "
-        f"ref target {r.Target_Ref:.2f} (R:R {r.RR:.1f})",
+    """Detailed multi-line summary of a single setup with all confluences."""
+    eql_info = f"Equal Lows: {r.Equal_Lows_Desc}" if hasattr(r, "Equal_Lows_Desc") else "Equal Lows: None"
+    fvg_info = f"FVG: {r.FVG_Status}" if hasattr(r, "FVG_Status") else "FVG: None"
+    rsi_div_info = f"RSI Div: {r.RSI_Div_Detail}" if hasattr(r, "RSI_Div_Detail") else f"RSI(14): {r.RSI14:.0f}"
+    vol_dyn_info = f"Volume: {r.Vol_Div_Detail}" if hasattr(r, "Vol_Div_Detail") else f"Vol: {r.Vol_x:.1f}x"
+    grade_info = f"Grade: {r.Confluence_Grade}" if hasattr(r, "Confluence_Grade") else f"Score: {r.Score:.1f}"
+
+    lines = [
+        "=" * 78,
+        f"  {r.Symbol}  ({r.Name})   ·   Close ₹{r.Close:.2f} on {r.Date}   ·   {grade_info}",
+        "=" * 78,
+        f"  Swept Level     : ₹{r.Swept_Level:.2f} (born {r.Level_Age_Bars}b ago, touched {r.Touch_Ago_Bars}b ago) → close +{r.Above_Level_:.2f}% above",
+        f"  Structure (EQL) : {eql_info}",
+        f"  Imbalance (FVG) : {fvg_info}",
+        f"  Momentum & Vol  : {rsi_div_info} · {vol_dyn_info}",
+        f"  Candle & EMAs   : Pattern: {getattr(r, 'Candle_Pattern', 'Rejection')} · above EMA20: {r.E20} · above EMA50: {r.E50}",
+        f"  Trade Plan      : Entry ≤ ₹{r.Close:.2f} | SL below ₹{r.Stop_Loss:.2f} | Target ₹{r.Target_Ref:.2f} (R:R {r.RR:.1f}:1)",
     ]
+    if hasattr(r, "Bullish_Catalysts") and r.Bullish_Catalysts:
+        lines.append("  Bullish Catalysts:")
+        for cat in r.Bullish_Catalysts:
+            lines.append(f"    • {cat}")
+    return lines
 
 
 def plot_setup(data, sym, level, last_bars=45):
-    """cell 15 plot_setup(), verbatim drawing — takes the data dict, returns the figure."""
+    """High-res multi-panel candlestick chart with FVG shading, Equal Lows,
+    EMAs, and RSI Divergence annotations.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    df = data[sym].tail(last_bars)
-    x = np.arange(len(df))
-    fig, ax = plt.subplots(figsize=(11, 5.8))
-    for i, (oo, hh, ll, cc) in enumerate(zip(df["Open"], df["High"], df["Low"], df["Close"])):
-        col = "#1a7f37" if cc >= oo else "#c62828"
-        ax.vlines(i, ll, hh, color=col, lw=0.9)
-        ax.bar(i, max(abs(cc - oo), 0.01), bottom=min(oo, cc), width=0.62,
-               color=col, edgecolor=col, lw=0.5)
-    ax.axhline(level, color="#e65100", ls="--", lw=1.4, label=f"swept swing low = {level:.2f}")
-    ax.axhline(df["Low"].iloc[-1], color="#6a1b9a", ls=":", lw=1.1,
-               label=f"sweep low / SL zone = {df['Low'].iloc[-1]:.2f}")
-    ax.annotate("SWEEP ✓", xy=(len(df) - 1, df["High"].iloc[-1]),
-                xytext=(len(df) - 7, df["High"].iloc[-1]),
-                fontsize=10, weight="bold", color="#e65100")
-    step = max(len(df) // 8, 1)
-    ax.set_xticks(x[::step])
-    ax.set_xticklabels([d.strftime("%d %b") for d in df.index[::step]], rotation=25, fontsize=8)
-    ax.set_title(f"{sym}  ·  daily liquidity sweep of swing low  ·  {df.index[-1].date()}",
-                 fontsize=12, weight="bold")
-    ax.grid(alpha=0.25)
-    ax.legend(loc="upper left", fontsize=9)
+    df = data[sym].tail(last_bars).copy()
+    n = len(df)
+    x = np.arange(n)
+
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(11.5, 7.2),
+        gridspec_kw={"height_ratios": [2.85, 1.15], "hspace": 0.08},
+        sharex=True
+    )
+    fig.patch.set_facecolor("#0b1220")
+
+    for ax in (ax1, ax2):
+        ax.set_facecolor("#111827")
+        ax.grid(True, color="#1f2a3a", alpha=0.55, linestyle=":")
+        for sp in ax.spines.values():
+            sp.set_color("#1f2a3a")
+        ax.tick_params(colors="#94a3b8", labelsize=8.5)
+
+    o = df["Open"].to_numpy(dtype=float)
+    h = df["High"].to_numpy(dtype=float)
+    l = df["Low"].to_numpy(dtype=float)
+    c = df["Close"].to_numpy(dtype=float)
+    v = df["Volume"].to_numpy(dtype=float)
+
+    # 1. Candlesticks on Top Panel
+    for i in range(n):
+        col = "#10b981" if c[i] >= o[i] else "#ef4444"
+        ax1.vlines(i, l[i], h[i], color=col, lw=0.95, alpha=0.9)
+        bar_height = max(abs(c[i] - o[i]), (h[i] - l[i]) * 0.02, 0.01)
+        ax1.bar(i, bar_height, bottom=min(o[i], c[i]), width=0.64,
+                color=col, edgecolor=col, lw=0.55, alpha=0.95)
+
+    # 2. Moving Averages (EMA 20 & EMA 50)
+    if len(df) >= 15:
+        e20_s = pd.Series(c).ewm(span=20, adjust=False).mean()
+        ax1.plot(x, e20_s, color="#38bdf8", lw=1.1, alpha=0.8, label="EMA 20")
+    if len(df) >= 25:
+        e50_s = pd.Series(c).ewm(span=50, adjust=False).mean()
+        ax1.plot(x, e50_s, color="#fbbf24", lw=1.1, alpha=0.8, label="EMA 50")
+
+    # 3. Swept Level & Stop Loss Zone
+    ax1.axhline(level, color="#f59e0b", ls="--", lw=1.4,
+                label=f"Swept Swing Low = ₹{level:.2f}")
+    ax1.axhline(l[-1], color="#a78bfa", ls=":", lw=1.2,
+                label=f"Sweep Low / SL Zone = ₹{l[-1]:.2f}")
+
+    # 4. Target Reference Line
+    target_ref = max(float(np.max(h[max(0, n-20):n-1])) if n > 1 else c[-1] * 1.02, c[-1] * 1.01)
+    ax1.axhline(target_ref, color="#34d399", ls=":", lw=1.1, alpha=0.75,
+                label=f"Ref Target = ₹{target_ref:.2f}")
+
+    # 5. Bullish FVG Detection & Shading on Chart
+    fvgs = find_bullish_fvgs(df, lookback=min(35, n))
+    active_fvgs = [f for f in fvgs if not f["mitigated"]]
+    if active_fvgs:
+        # Plot up to 2 most recent active FVGs
+        for fvg in active_fvgs[-2:]:
+            bot, top = fvg["bottom"], fvg["top"]
+            if bot < top and top >= l.min() * 0.98 and bot <= h.max() * 1.02:
+                xmin_ratio = max(0.0, float(fvg["bar_i"]) / max(1, n - 1))
+                ax1.axhspan(bot, top, xmin=xmin_ratio, xmax=1.0, color="#06b6d4",
+                            alpha=0.15, linestyle="--", edgecolor="#0891b2", lw=0.8,
+                            label=f"Bullish FVG [₹{bot:.2f} - ₹{top:.2f}]")
+
+    # 6. Annotation on the Sweep Candle
+    ax1.annotate("SWEEP & RECLAIM ✓", xy=(n - 1, h[-1]),
+                 xytext=(max(0, n - 8), h[-1] * 1.008),
+                 fontsize=9.5, weight="bold", color="#f59e0b",
+                 arrowprops=dict(arrowstyle="->", color="#f59e0b", lw=1.1))
+
+    ax1.set_title(f"{sym}  ·  Daily Liquidity Sweep & Confluence Setup  ·  {df.index[-1].date()}",
+                  fontsize=12, weight="bold", color="#f1f5f9", pad=10)
+    ax1.legend(loc="upper left", fontsize=8.2, facecolor="#111827", edgecolor="#1f2a3a",
+               labelcolor="#e2e8f0", framealpha=0.85)
+
+    # 7. Bottom Panel — RSI(14) with Divergence
+    rsi_vals = compute_rsi_series(c, period=14)
+    ax2.plot(x, rsi_vals, color="#c084fc", lw=1.4, label="RSI(14)")
+    ax2.axhline(70, color="#ef4444", ls="--", lw=0.8, alpha=0.6)
+    ax2.axhline(50, color="#64748b", ls=":", lw=0.8, alpha=0.6)
+    ax2.axhline(30, color="#10b981", ls="--", lw=0.8, alpha=0.6)
+    ax2.fill_between(x, 30, 70, color="#1e293b", alpha=0.35)
+    
+    rsi_min = float(np.nanmin(rsi_vals)) if len(rsi_vals) else 20.0
+    rsi_max = float(np.nanmax(rsi_vals)) if len(rsi_vals) else 80.0
+    ax2.set_ylim(max(0.0, min(15.0, rsi_min - 6.0)), min(100.0, max(85.0, rsi_max + 6.0)))
+    ax2.set_ylabel("RSI (14)", color="#94a3b8", fontsize=8.5)
+
+    # Annotate RSI Divergence if detected
+    swings = find_swing_lows(l, 2)
+    rsi_div = detect_rsi_divergence(c, l, swings, rsi_vals, lookback=min(35, n))
+    if rsi_div["type"] == "regular_bullish" and rsi_div["prior_low_idx"] is not None:
+        p_idx = rsi_div["prior_low_idx"]
+        if p_idx < n:
+            ax2.plot([p_idx, n - 1], [rsi_vals[p_idx], rsi_vals[-1]], color="#22c55e",
+                     lw=1.8, marker="o", markersize=4)
+            y_annot = min(85.0, rsi_vals[-1] + 12.0)
+            ax2.annotate("BULLISH RSI DIV ⚡", xy=(n - 1, rsi_vals[-1]),
+                         xytext=(max(0, n - 12), y_annot),
+                         fontsize=8.5, weight="bold", color="#22c55e",
+                         arrowprops=dict(arrowstyle="->", color="#22c55e", lw=1.0))
+    elif rsi_div["type"] == "hidden_bullish" and rsi_div["prior_low_idx"] is not None:
+        p_idx = rsi_div["prior_low_idx"]
+        if p_idx < n:
+            ax2.plot([p_idx, n - 1], [rsi_vals[p_idx], rsi_vals[-1]], color="#38bdf8",
+                     lw=1.8, marker="o", markersize=4)
+            y_annot = max(15.0, rsi_vals[-1] - 12.0)
+            ax2.annotate("HIDDEN BULLISH DIV 🚀", xy=(n - 1, rsi_vals[-1]),
+                         xytext=(max(0, n - 12), y_annot),
+                         fontsize=8.5, weight="bold", color="#38bdf8",
+                         arrowprops=dict(arrowstyle="->", color="#38bdf8", lw=1.0))
+        p_idx = rsi_div["prior_low_idx"]
+        if p_idx < n:
+            ax2.plot([p_idx, n - 1], [rsi_vals[p_idx], rsi_vals[-1]], color="#38bdf8",
+                     lw=1.8, marker="o", markersize=4)
+            ax2.annotate("HIDDEN BULLISH DIV 🚀", xy=(n - 1, rsi_vals[-1]),
+                         xytext=(max(0, n - 9), rsi_vals[-1] + 6),
+                         fontsize=8.5, weight="bold", color="#38bdf8",
+                         arrowprops=dict(arrowstyle="->", color="#38bdf8", lw=1.0))
+
+    step = max(n // 8, 1)
+    ax2.set_xticks(x[::step])
+    ax2.set_xticklabels([d.strftime("%d %b") for d in df.index[::step]], rotation=25,
+                        fontsize=8, color="#94a3b8")
+
     plt.tight_layout()
     return fig

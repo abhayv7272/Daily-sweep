@@ -36,9 +36,12 @@ CONFIG = {
     "require_bullish_close": True,  # close > open
     "require_prior_above": True,    # previous close above the level (true sweep)
     "min_price": 10.0,              # ignore sub-₹10 names
-    # ---- Scoring ----
+    # ---- Scoring & Confluence ----
     "volume_lookback": 20,
     "rsi_period": 14,
+    "fvg_lookback": 40,             # bars to look back for active Bullish FVG
+    "rsi_div_lookback": 35,         # bars to look back for RSI divergence
+    "major_low_lookback": 60,       # bars to look back for major structural low
 }
 
 REPORT = {

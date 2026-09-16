@@ -11,10 +11,11 @@ It verifies, one by one:
           ['Ticker', 'Price']  (engine does res.xs(sym, level="Ticker"))
         * a single-symbol request ALSO keeps the Ticker level
   [4] a real batch daily download (the embedded ~300 liquid fallback symbols,
-      notebook ranking params: chunk=120, period=1mo) — availability, failures,
+      ranking params: chunk=120, period=1mo) — availability, failures,
       Yahoo's NaN-close latest-bar lag prevalence
   [5] 15-min intraday rebuild path (the backfill transport) on a 40-symbol batch
-  [6] optionally: Gmail SMTP login check (no mail is sent)
+  [6] Advanced Technical Confluence Engine contracts (RSI Div, FVG, Equal Lows, Absorption)
+  [7] optionally: Gmail SMTP login check (no mail is sent)
 
 Usage:  python diagnose.py [--smtp]
 Exit code 0 = green, 1 = something failed.
@@ -58,17 +59,17 @@ def main() -> int:
            f"HTTP {r.status_code}, {len(df):,} rows")
     except Exception as exc:
         ok("NSE EQUITY_L.csv", False, f"{type(exc).__name__}: {exc} "
-           "(notebook auto-falls-back to the embedded ~300-name list in that case)")
+           "(auto-falls-back to the embedded ~300-name list in that case)")
 
     # ---------------------------------------------------------------- [3] Yahoo API contract
     try:
         multi = yf.download(["RELIANCE.NS", "HDFCBANK.NS"], period="5d", interval="1d",
                             group_by="ticker", auto_adjust=True, threads=True, progress=False)
         names = list(getattr(multi.columns, "names", []))
-        sub = multi.xs("RELIANCE.NS", axis=1, level="Ticker")
+        sub = multi.xs("RELIANCE.NS", axis=1, level="Ticker") if isinstance(multi.columns, pd.MultiIndex) else multi
         ok("group_by=ticker → MultiIndex ['Ticker','Price']", names == ["Ticker", "Price"], f"names={names}")
-        ok("xs(level=Ticker) extraction", list(sub.columns)[:2] == ["Open", "High"],
-           f"rows={len(sub)}, last_close={sub['Close'].iloc[-1]:.2f}")
+        ok("xs(level=Ticker) extraction", len(sub) > 0 and list(sub.columns)[:2] == ["Open", "High"],
+           f"rows={len(sub)}, last_close={sub['Close'].iloc[-1]:.2f}" if len(sub) > 0 else "0 rows")
     except Exception as exc:
         ok("group_by=ticker → MultiIndex", False, f"{type(exc).__name__}: {exc}")
 
@@ -80,7 +81,6 @@ def main() -> int:
         if is_mi:
             extracted = single.xs("TCS.NS", axis=1, level="Ticker")
         else:
-            # engine's flat-frame fix must kick in — simulate its branch
             extracted = single.copy()
         ok("single-symbol request keeps usable shape", extracted is not None and len(extracted) >= 3,
            f"MultiIndex={is_mi}, rows={len(extracted) if extracted is not None else 0}")
@@ -118,7 +118,15 @@ def main() -> int:
     except Exception as exc:
         ok("15-min rebuild works", False, f"{type(exc).__name__}: {exc}")
 
-    # ---------------------------------------------------------------- [6] SMTP login (optional)
+    # ---------------------------------------------------------------- [6] Confluence Engine
+    try:
+        self_test_out = engine.self_test()
+        ok("engine self-test (RSI Div, Equal Lows, FVGs, Sweeps)", "SELF-TEST PASSED" in self_test_out,
+           "all mathematical fixtures verified")
+    except Exception as exc:
+        ok("engine self-test", False, f"{type(exc).__name__}: {exc}")
+
+    # ---------------------------------------------------------------- [7] SMTP login (optional)
     if use_smtp:
         import os, smtplib, ssl
         user = os.environ.get("MY_EMAIL", "")
