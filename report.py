@@ -183,7 +183,8 @@ def build_html(res: Optional[pd.DataFrame], show: Optional[pd.DataFrame],
         f"<div style='font:600 11px {FONT};color:{ACCENT};letter-spacing:1.6px;"
         f"text-transform:uppercase'>NSE · Daily Liquidity-Sweep Screener — Swing-Buy Setups</div>"
         f"<div style='font:700 26px {FONT};color:{TXT};margin:9px 0 6px'>{_esc(verdict)}</div>"
-        f"<div style='font:400 13px {FONT};color:{MUTE}'>Generated {_esc(stamp)} IST · "
+        f"<div style='font:400 13px {FONT};color:{MUTE}'>Generated {_esc(stamp)} IST"
+        f"<b style='color:{AMBER}'>{_esc(str(stats.get('queue_delay_note', '')))}</b> · "
         f"Top {stats.get('universe_size', 1000):,} NSE stocks by turnover scanned on their "
         f"<b style='color:{TXT}'>latest daily candle</b> — sweep of a swing low, taken and "
         f"<b style='color:{TXT}'>reclaimed by the close</b></div></div>",
