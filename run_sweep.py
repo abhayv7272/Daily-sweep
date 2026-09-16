@@ -50,9 +50,13 @@ def log(msg: str = "") -> None:
 
 
 def _queue_delay_note(now: dt.datetime) -> str:
-    """Honesty note for the report header: GitHub's cron is a best-effort queue,
-    not a timer — on busy days it fires hours late (14-15 Sept 2026: 4-5h).
-    EXPECTED_SEND_IST (e.g. "20:30", set only for scheduled runs) is compared
+    """Honesty note for the report header.
+
+    The daily run is kicked off by an external scheduler (cron-job.org) via
+    `repository_dispatch`, which fires on time — but GitHub's shared runner pool
+    is still best-effort, so the job itself can start late (14-15 Sept 2026 the
+    old internal cron started 4-5h after its slot).
+    EXPECTED_SEND_IST (e.g. "20:30", set only for automatic runs) is compared
     with the actual time; if the run is >25 min late we say so in the email, so
     a late email never again looks like a silent bug."""
     expected = os.environ.get("EXPECTED_SEND_IST", "").strip()
@@ -72,8 +76,8 @@ def _queue_delay_note(now: dt.datetime) -> str:
         late_min += 1440
     if late_min <= 25:
         return ""
-    return (f" · run queued {int(late_min // 60)}h {round(late_min % 60)}m late by GitHub "
-            f"(planned ~{expected} IST)")
+    return (f" · run started {int(late_min // 60)}h {round(late_min % 60)}m late "
+            f"(planned ~{expected} IST · GitHub runner queue)")
 
 
 # -------------------------------------------------------------------------- demo market
