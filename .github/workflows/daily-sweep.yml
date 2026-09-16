@@ -70,17 +70,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # FAIL-OPEN guard: agar aaj (IST) already ek SUCCESSFUL automated run ho
-          # chuka hai — matlab email already chali gayi hai — to is run par email
-          # skip kar do, warna duplicate email chali jaati hai (double ping,
-          # cron-job.org retry, ya galti se do scheduler lag jayein to).
-          # Manual (workflow_dispatch) run is guard ke bahar hai — wo hamesha
-          # wahi karta hai jo aapne input diya.
-          # Check fail hua (API/rate-limit/jq) to PRIOR khali rehta hai aur email
-          # normally chali jaati hai: guard kabhi legit email nahi rokta.
-          TODAY_IST=$(TZ=Asia/Kolkata date +%F)
-          CUTOFF=$(TZ=Asia/Kolkata date -d "$TODAY_IST 00:00" +%s)
-          echo "Looking for an already-successful automated run since $TODAY_IST 00:00 IST (epoch $CUTOFF)..."
+          # FAIL-OPEN guard: agar PICHHLE 12 GHANTE mein isi branch ka koi
+          # automatic run SUCCESSFULLY complete ho chuka hai — matlab aaj ki
+          # email already chali gayi hai — to is run se email skip kar do, warna
+          # duplicate email chali jaati hai (double ping, cron-job.org retry, ya
+          # galti se do scheduler lag jayein to).
+          #
+          # 12h rolling window, "aaj ki IST date" NAHI: duplicate midnight IST ke
+          # aas-paas straddle kar sakta hai — 16 Sept 2026 ko schedule-run 23:15
+          # IST aur dispatch-run 00:03 IST (agli date) par hua, dono successful,
+          # do emails. Normal cadence 24h hai, isliye 12h window legit email nahi
+          # rokti.
+          #
+          # Manual (workflow_dispatch) run is guard ke bahar hai — wo hamesha wahi
+          # karta hai jo aapne input diya. Check fail hua (API/rate-limit/jq) to
+          # PRIOR khali rehta hai aur email normally chali jaati hai.
+          NOW=$(date +%s)
+          CUTOFF=$(( NOW - 43200 ))
+          echo "Looking for an already-successful automatic run since $(TZ=Asia/Kolkata date -d "@$CUTOFF" +'%F %H:%M IST') (epoch $CUTOFF)..."
           PRIOR=$( { gh run list \
                        --workflow=daily-sweep.yml \
                        --branch="$GITHUB_REF_NAME" \
@@ -96,12 +103,12 @@ jobs:
           if [ -n "$PRIOR" ] && [ "$PRIOR" -gt 0 ] 2>/dev/null; then
             echo "skip_email=true" >> "$GITHUB_OUTPUT"
             {
-              echo "⚠️ **Duplicate-email guard:** aaj ($TODAY_IST IST) ek automated run already successful raha hai, isliye is run se email nahi bheji gayi."
-              echo "Report + artifacts is run par bhi bane hain (proof ki pipeline healthy hai)."
+              echo "⚠️ **Duplicate-email guard:** pichhle 12 ghante mein ek automatic run already successful raha hai (aaj ki email ja chuki hai), isliye is run se email nahi bheji gayi."
+              echo "Report + artifacts is run par bhi bane hain (proof ki pipeline healthy hai). Dobara email chahiye to **Actions → Run workflow** (manual) chalao."
             } >> "$GITHUB_STEP_SUMMARY"
           else
             echo "skip_email=false" >> "$GITHUB_OUTPUT"
-            echo "No prior successful automated run today (prior='${PRIOR:-check unavailable}') ⇒ email will be sent."
+            echo "No successful automatic run in the last 12h (prior='${PRIOR:-check unavailable}') ⇒ email will be sent."
           fi
 
       - name: Run screener and email the report

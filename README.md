@@ -105,7 +105,7 @@ config.py                                  # saare knobs (notebook SweepConfig +
 | Kisi din 0 setups | Normal hai — pattern roz nahi banta. Email tab bhi aayegi |
 | Automatic email poori tarah aana band ho gayi | cron-job.org job dekho — active hai? last request `204/2xx` tha? token expire to nahi? (§7a). Repo mein ab GitHub ka koi internal cron **nahi** hai, isliye wahi ping ek lauta automatic trigger hai |
 | Ek hi din do emails aayi thi | Purana issue, **fix ho chuka**: GitHub ka internal `schedule:` cron hata diya gaya — ab sirf cron-job.org ping automatic run karta hai, upar se duplicate guard (§7b) bhi hai |
-| Run green hai par email nahi aayi, run summary mein "Duplicate-email guard" | Aaj already ek successful automated run ho chuka tha, isliye dusri email jaan-boojh kar roki gayi (artifacts us run par bhi bante hain). Email dobara chahiye to **Actions → Run workflow** (manual) chalao — manual run guard se bahar hai |
+| Run green hai par email nahi aayi, run summary mein "Duplicate-email guard" | Pichhle 12 ghante mein already ek successful automatic run ho chuka tha, isliye dusri email jaan-boojh kar roki gayi (artifacts us run par bhi bante hain). Email dobara chahiye to **Actions → Run workflow** (manual) chalao — manual run guard se bahar hai |
 | Email 20:30 se kaafi der se aayi | Pehle report header ka amber note dekho — *"run started Xh Ym late (planned ~20:30 IST · GitHub runner queue)"* likha hai to ping apne waqt par pahuncha tha, deri GitHub ke shared runner pool ki thi. Roz ho raha ho to §7a ki job timing 10–15 minute pehle kar do |
 | Local demo dekhna ho | `pip install -r requirements.txt && python run_sweep.py --demo --no-email` → `out/` mein sample report |
 
@@ -125,8 +125,9 @@ GitHub ka internal cron is repo se hata diya gaya hai (duplicate email ka reason
 
 ### §7b — Duplicate-email guard
 
-Workflow mein ek chhota **fail-open** guard hai: automatic run par wo dekhta hai ki **aaj (IST) isi branch ka koi automatic run already successfully complete ho chuka hai ya nahi**. Ho chuka hai ⇒ is run se email skip (report + artifacts phir bhi bante hain, aur run summary mein saaf likha aata hai). Do scheduler lag jayein, cron-job.org retry kar de, ya galti se double ping ho jaye — email ek hi baar jaati hai.
+Workflow mein ek chhota **fail-open** guard hai: automatic run par wo dekhta hai ki **pichhle 12 ghante mein isi branch ka koi automatic run already successfully complete hua hai ya nahi**. Hua hai ⇒ is run se email skip (report + artifacts phir bhi bante hain, aur run summary mein saaf likha aata hai). Do scheduler lag jayein, cron-job.org retry kar de, ya galti se double ping ho jaye — email ek hi baar jaati hai.
 
+- Window **12 ghante ki rolling** hai, "aaj ki IST date" nahi: duplicate midnight ke aas-paas straddle kar sakta hai — 16 Sept 2026 ko ek run **23:15 IST** aur dusra **00:03 IST** (agli date) par hua tha, dono successful ⇒ do emails. Normal cadence 24h hai, isliye 12h window kabhi legit email nahi rokta.
 - Manual run (`workflow_dispatch`) guard ke **bahar** hai — wo email hamesha bhejta hai.
 - Guard **fail-open** hai: GitHub API/`jq` check mein koi dikkat aayi to email normally chali jaati hai, guard kabhi legit email nahi rokta. Isi liye workflow ko `actions: read` permission chahiye.
 - Guard hatana ho to `.github/workflows/daily-sweep.yml` ka *"Duplicate-email guard"* step delete kar do — baaki pipeline par koi asar nahi.
