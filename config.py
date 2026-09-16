@@ -3,7 +3,7 @@ config.py — knobs for the NSE DAILY Liquidity-Sweep Screener automation.
 
 `CONFIG` mirrors the notebook's SweepConfig defaults VERBATIM (cell 3 of
 NSE_Liquidity_Sweep_Screener_FIXED.ipynb) so the unattended run reproduces the
-Colab result exactly. Change a value here and the 19:30 IST job picks it up —
+Colab result exactly. Change a value here and the 20:30 IST job picks it up —
 no engine edits needed. Leave it untouched and it matches the notebook 1:1.
 
 `REPORT` only affects presentation (email/report), never the screening logic.

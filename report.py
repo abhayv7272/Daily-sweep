@@ -369,7 +369,7 @@ def build_html(res: Optional[pd.DataFrame], show: Optional[pd.DataFrame],
             f"<b>No stock printed a confirmed liquidity sweep on {asof}.</b><br>"
             f"<span style='color:{MUTE}'>This is normal and disciplined — false breakouts/sweeps happen often, "
             f"but high-quality liquidity sweeps with proper wicks and positive closes appear 0–5 times a day. "
-            f"The scanner is ready for tomorrow's market close at 19:30 IST.</span></div>")
+            f"The scanner is ready for tomorrow's market close at 20:30 IST.</span></div>")
 
     # Individual Setup Spotlight Cards with Charts
     if charts and n_hits:
@@ -518,7 +518,7 @@ def build_html(res: Optional[pd.DataFrame], show: Optional[pd.DataFrame],
         f"This tool detects Smart Money liquidity sweep and confluence setups on NSE daily candles. "
         f"Always verify charts independently and enforce strict risk management on every position.<br><br>"
         f"Automated by <b style='color:{TXT}'>Daily-sweep</b> on GitHub Actions · "
-        f"Scheduled every trading day at 19:30 IST."
+        f"Scheduled every trading day at 20:30 IST."
         f"</div></div></div>")
 
     return ("<!doctype html><html><head><meta charset='utf-8'>"
